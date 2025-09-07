@@ -1,0 +1,1039 @@
+#!/bin/bash
+
+set -e
+
+# Configuration
+WORK_ROOT="$HOME/.linux_vm_cli"
+IMAGES_DIR="$WORK_ROOT/images"
+VMS_DIR="$WORK_ROOT/vms"
+DEFAULT_USERNAME="user01"
+DEFAULT_MEMORY="2G"
+DEFAULT_CPUS="2"
+DEFAULT_DISK="10G"
+
+get_image_url() {
+    case "$1" in
+        debian12)
+            echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+get_available_images() {
+    echo "debian12 ubuntu22 ubuntu24"
+}
+
+# Required binaries
+REQUIRED_BINS=(
+    "qemu-system-aarch64"
+    "qemu-img"
+    "hdiutil"
+)
+
+usage() {
+    cat <<EOF
+Usage: $0 ENTITY COMMAND [options]
+
+Entities:
+    vm                  Virtual machine operations
+    image               Image management operations
+
+VM Commands:
+    create              Create and start a new VM
+    list                List all VMs and their status
+    start VM_NAME       Start an existing VM
+    stop VM_NAME        Stop a running VM
+    delete VM_NAME      Delete a VM and its files
+
+Image Commands:
+    list                List available and downloaded images
+    pull IMAGE_NAME     Download an image (e.g., debian12, ubuntu22, ubuntu24)
+    delete IMAGE_NAME   Delete a downloaded image
+
+VM Create options:
+    --name NAME         VM name (required)
+    --image IMAGE       Base image (default: debian12, options: debian12, ubuntu22, ubuntu24)
+    --user USERNAME     Username (default: $DEFAULT_USERNAME)
+    --pass PASSWORD     Password (default: auto-generated)
+    --memory SIZE       Memory size (default: $DEFAULT_MEMORY)
+    --cpus COUNT        CPU count (default: $DEFAULT_CPUS)
+    --disk SIZE         Disk size (default: $DEFAULT_DISK)
+    --ssh-port PORT     SSH port (default: auto-assign)
+    --show-console      Show console output
+
+Examples:
+    $0 image pull debian12
+    $0 vm create --name myvm --memory 4G --cpus 4
+    $0 vm create --name myvm --image ubuntu22 --memory 4G --cpus 4
+    $0 vm list
+    $0 vm start myvm
+    $0 vm stop myvm
+    $0 vm delete myvm
+    $0 image list
+    $0 image delete debian12
+EOF
+}
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*"
+}
+
+error() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+check_dependencies() {
+    local missing=()
+    for bin in "${REQUIRED_BINS[@]}"; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            missing+=("$bin")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        # Check if brew is available
+        if command -v brew >/dev/null 2>&1; then
+            if brew install qemu >/dev/null 2>&1; then
+                # Verify installation
+                local still_missing=()
+                for bin in "${REQUIRED_BINS[@]}"; do
+                    if ! command -v "$bin" >/dev/null 2>&1; then
+                        still_missing+=("$bin")
+                    fi
+                done
+                
+                if [[ ${#still_missing[@]} -gt 0 ]]; then
+                    error "Installation failed. Still missing: ${still_missing[*]}"
+                fi
+            else
+                error "Failed to install QEMU with brew. Please install manually: brew install qemu"
+            fi
+        else
+            error "Missing dependencies: ${missing[*]}. Install Homebrew first, then run: brew install qemu"
+        fi
+    fi
+}
+
+generate_password() {
+    local length=${1:-16}
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length"
+}
+
+find_free_port() {
+    local preferred=$1
+    
+    # Function to check if a port is actually free and can be bound
+    check_port_bindable() {
+        local test_port=$1
+        
+        # First check with lsof (most reliable on macOS)
+        if command -v lsof >/dev/null 2>&1; then
+            if lsof -i ":$test_port" >/dev/null 2>&1; then
+                return 1  # Port is in use
+            fi
+        fi
+        
+        # Also check with netstat
+        if command -v netstat >/dev/null 2>&1; then
+            if netstat -an 2>/dev/null | grep -q "\\.$test_port " || netstat -an 2>/dev/null | grep -q ":$test_port "; then
+                return 1  # Port appears to be in use
+            fi
+        fi
+        
+        # Try to actually connect to the port to test if something is listening
+        if command -v nc >/dev/null 2>&1; then
+            # On macOS, nc might have different syntax - try both variants
+            if nc -z 127.0.0.1 "$test_port" 2>/dev/null || nc -w 1 127.0.0.1 "$test_port" </dev/null >/dev/null 2>&1; then
+                return 1  # Something is listening on the port
+            fi
+        fi
+        
+        return 0  # Port appears to be free
+    }
+    
+    # Check preferred port first
+    if [[ -n "$preferred" && "$preferred" -gt 0 ]]; then
+        if check_port_bindable "$preferred"; then
+            echo "$preferred"
+            return
+        fi
+        log "Preferred port $preferred is in use, finding alternative..."
+    fi
+    
+    # Find a free port in the range 2222-9999, but skip commonly used ports
+    local skip_ports=(3000 3306 5432 5000 8000 8080 8443 9000)
+    for port in $(seq 2222 9999); do
+        # Skip commonly used ports
+        local skip=false
+        for skip_port in "${skip_ports[@]}"; do
+            if [[ "$port" -eq "$skip_port" ]]; then
+                skip=true
+                break
+            fi
+        done
+        [[ "$skip" == true ]] && continue
+        
+        if check_port_bindable "$port"; then
+            echo "$port"
+            return
+        fi
+    done
+    
+    error "No free port found in range 2222-9999"
+}
+
+download_image() {
+    local image_name="$1"
+    local url
+    url=$(get_image_url "$image_name")
+    
+    if [[ -z "$url" ]]; then
+        error "Unknown image: $image_name. Available: $(get_available_images)"
+    fi
+    
+    local filename="${image_name}.qcow2"
+    local dest="$IMAGES_DIR/$filename"
+    
+    if [[ -f "$dest" ]]; then
+        echo "$dest"
+        return
+    fi
+    
+    log "Downloading $image_name image..."
+    mkdir -p "$IMAGES_DIR"
+    
+    # Download to temporary file first
+    local temp_file="$dest.tmp"
+    if curl -L -o "$temp_file" "$url"; then
+        # Convert to qcow2 if needed
+        if [[ "$url" == *.img ]]; then
+            qemu-img convert -O qcow2 "$temp_file" "$dest"
+            rm "$temp_file"
+        else
+            mv "$temp_file" "$dest"
+        fi
+        echo "$dest"
+    else
+        rm -f "$temp_file"
+        error "Failed to download image: $image_name"
+    fi
+}
+
+create_cloud_init() {
+    local vm_dir="$1"
+    local username="$2"
+    local password="$3"
+    local hostname="$4"
+    
+    local user_data=$(cat <<EOF
+#cloud-config
+datasource_list: [ NoCloud, None ]
+final_message: "CLOUD-INIT-READY"
+package_update: false
+packages:
+  - openssh-server
+output:
+  all: '| tee -a /var/log/cloud-init-output.log'
+users:
+  - name: $username
+    gecos: $username
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: '$password'
+ssh_pwauth: true
+chpasswd:
+  list: |
+    $username:$password
+  expire: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      PermitRootLogin prohibit-password
+      UseDNS no
+      GSSAPIAuthentication no
+runcmd:
+  - echo "$username:$password" | chpasswd
+  - passwd -u $username
+  - systemctl enable ssh
+  - systemctl start ssh
+EOF
+)
+    
+    local meta_data="{\"instance-id\": \"$hostname\", \"local-hostname\": \"$hostname\"}"
+    local seed_iso="$vm_dir/seed.iso"
+    
+    # Create temporary directory for cloud-init files
+    local tmpdir=$(mktemp -d)
+    echo "$user_data" > "$tmpdir/user-data"
+    echo "$meta_data" > "$tmpdir/meta-data"
+    
+    # Create ISO using hdiutil
+    if hdiutil makehybrid -o "$seed_iso" -hfs -joliet -iso -default-volume-name "cidata" "$tmpdir" >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        echo "$seed_iso"
+        return
+    fi
+    
+    # Fallback to mkisofs/genisoimage
+    if command -v mkisofs >/dev/null 2>&1; then
+        mkisofs -V cidata -o "$seed_iso" -J -r "$tmpdir"
+    elif command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -V cidata -o "$seed_iso" -J -r "$tmpdir"
+    else
+        rm -rf "$tmpdir"
+        error "Failed to create cloud-init ISO. Install mkisofs or genisoimage"
+    fi
+    
+    rm -rf "$tmpdir"
+    echo "$seed_iso"
+}
+
+detect_firmware() {
+    local candidates=(
+        "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+        "/usr/local/share/qemu/edk2-aarch64-code.fd"
+        "/usr/share/qemu/edk2-aarch64-code.fd"
+        "/usr/share/edk2/aarch64/QEMU_EFI.fd"
+        "/usr/share/AAVMF/AAVMF_CODE.fd"
+    )
+    
+    for firmware in "${candidates[@]}"; do
+        if [[ -f "$firmware" ]]; then
+            echo "$firmware"
+            return
+        fi
+    done
+    
+    error "AArch64 UEFI firmware not found. Install with: brew install qemu"
+}
+
+wait_for_ssh() {
+    local host="$1"
+    local port="$2"
+    local timeout=120
+    local count=0
+    
+    while [[ $count -lt $timeout ]]; do
+        if nc -z "$host" "$port" 2>/dev/null; then
+            sleep 2  # Give SSH a moment to be fully ready
+            if nc -z "$host" "$port" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        sleep 1
+        ((count++))
+    done
+    
+    return 1
+}
+
+# Image management functions
+image_list() {
+    echo
+    printf "%-15s %-10s %-s\n" "IMAGE" "STATUS" "URL"
+    printf "%-15s %-10s %-s\n" "-----" "------" "---"
+    
+    for image_name in $(get_available_images); do
+        local filename="${image_name}.qcow2"
+        local image_path="$IMAGES_DIR/$filename"
+        local status="AVAILABLE"
+        
+        if [[ -f "$image_path" ]]; then
+            local size=$(du -h "$image_path" | cut -f1)
+            status="DOWNLOADED ($size)"
+        fi
+        
+        local url
+        url=$(get_image_url "$image_name")
+        printf "%-15s %-10s %-s\n" "$image_name" "$status" "$url"
+    done
+    echo
+}
+
+image_pull() {
+    local image_name="$1"
+    [[ -z "$image_name" ]] && error "Image name is required"
+    
+    local url
+    url=$(get_image_url "$image_name")
+    if [[ -z "$url" ]]; then
+        error "Unknown image: $image_name. Available: $(get_available_images)"
+    fi
+    
+    download_image "$image_name" >/dev/null
+    log "Image $image_name downloaded successfully"
+}
+
+image_delete() {
+    local image_name="$1"
+    [[ -z "$image_name" ]] && error "Image name is required"
+    
+    local filename="${image_name}.qcow2"
+    local image_path="$IMAGES_DIR/$filename"
+    
+    if [[ ! -f "$image_path" ]]; then
+        error "Image $image_name is not downloaded"
+    fi
+    
+    # Check if any VMs are using this image
+    if [[ -d "$VMS_DIR" ]]; then
+        for vm_dir in "$VMS_DIR"/*; do
+            if [[ -d "$vm_dir" ]]; then
+                local info_file="$vm_dir/info.json"
+                if [[ -f "$info_file" ]]; then
+                    local vm_image=$(grep -o '"image": "[^"]*"' "$info_file" 2>/dev/null | cut -d'"' -f4)
+                    if [[ "$vm_image" == "$image_name" ]]; then
+                        local vm_name=$(basename "$vm_dir")
+                        error "Cannot delete image $image_name: still used by VM '$vm_name'"
+                    fi
+                fi
+            fi
+        done
+    fi
+    
+    echo "This will permanently delete the downloaded image '$image_name'."
+    read -p "Are you sure? (y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log "Deletion cancelled"
+        return
+    fi
+    
+    rm -f "$image_path"
+    log "Image $image_name deleted successfully"
+}
+
+# VM management functions
+vm_create() {
+    local name=""
+    local image=""
+    local username="$DEFAULT_USERNAME"
+    local password=""
+    local memory="$DEFAULT_MEMORY"
+    local cpus="$DEFAULT_CPUS"
+    local disk="$DEFAULT_DISK"
+    local ssh_port=""
+    local show_console=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name)
+                name="$2"
+                shift 2
+                ;;
+            --image)
+                image="$2"
+                shift 2
+                ;;
+            --user)
+                username="$2"
+                shift 2
+                ;;
+            --pass)
+                password="$2"
+                shift 2
+                ;;
+            --memory)
+                memory="$2"
+                shift 2
+                ;;
+            --cpus)
+                cpus="$2"
+                shift 2
+                ;;
+            --disk)
+                disk="$2"
+                shift 2
+                ;;
+            --ssh-port)
+                ssh_port="$2"
+                shift 2
+                ;;
+            --show-console)
+                show_console=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    [[ -z "$name" ]] && error "--name is required"
+    [[ -z "$image" ]] && image="debian12"
+    [[ -z "$password" ]] && password=$(generate_password 16)
+    [[ -z "$ssh_port" ]] && ssh_port=$(find_free_port)
+    
+    local vm_dir="$VMS_DIR/$name"
+    
+    # Check if VM already exists
+    if [[ -d "$vm_dir" ]]; then
+        local info_file="$vm_dir/info.json"
+        if [[ -f "$info_file" ]]; then
+            log "VM '$name' already exists. Checking if it's running..."
+            local pid_file="$vm_dir/qemu.pid"
+            if [[ -f "$pid_file" ]]; then
+                local pid=$(cat "$pid_file" 2>/dev/null)
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    local existing_port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+                    local existing_user=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                    local existing_pass=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                    error "VM '$name' is already running on port $existing_port (user: $existing_user, pass: $existing_pass)"
+                fi
+            fi
+            log "VM directory exists but VM is not running. Recreating..."
+        fi
+    fi
+    
+    mkdir -p "$vm_dir"
+    
+    log "Creating VM: $name"
+    
+    # Download base image
+    local base_image
+    base_image=$(download_image "$image")
+    
+    # Create VM disk
+    local vm_disk="$vm_dir/disk.qcow2"
+    if [[ ! -f "$vm_disk" ]]; then
+        qemu-img convert -O qcow2 "$base_image" "$vm_disk"
+        qemu-img resize "$vm_disk" "$disk" >/dev/null
+    fi
+    
+    # Create cloud-init seed
+    local seed_iso
+    seed_iso=$(create_cloud_init "$vm_dir" "$username" "$password" "$name")
+    
+    # Detect firmware
+    local firmware
+    firmware=$(detect_firmware)
+    
+    # Save VM info
+    local info_json="$vm_dir/info.json"
+    cat > "$info_json" <<EOF
+{
+  "name": "$name",
+  "arch": "arm64",
+  "image": "$image",
+  "username": "$username",
+  "password": "$password",
+  "ssh": {
+    "host": "127.0.0.1",
+    "port": $ssh_port
+  }
+}
+EOF
+    
+    # Build QEMU command
+    local qemu_args=(
+        "qemu-system-aarch64"
+        "-machine" "virt"
+        "-cpu" "max"
+        "-bios" "$firmware"
+        "-m" "$memory"
+        "-smp" "$cpus"
+        "-name" "$name"
+        "-device" "virtio-net-pci,netdev=n0"
+        "-netdev" "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+        "-device" "virtio-rng-pci"
+        "-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
+    )
+    
+    # Add cloud-init for first boot only
+    local first_boot_marker="$vm_dir/.first_boot_complete"
+    qemu_args+=("-cdrom" "$seed_iso")
+    
+    # Add acceleration if available
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        qemu_args+=("-accel" "hvf")
+    fi
+    
+    # Add console/display options
+    if [[ "$show_console" == true ]]; then
+        qemu_args+=("-nographic" "-serial" "mon:stdio" "-monitor" "none")
+        log "Starting VM with console (Ctrl+A then X to quit)"
+        log "Credentials: $username / $password"
+        log "SSH command: ssh $username@127.0.0.1 -p $ssh_port"
+        read -p "Press Enter to start..."
+        exec "${qemu_args[@]}"
+    else
+        local console_log="$vm_dir/console.log"
+        local pid_file="$vm_dir/qemu.pid"
+        qemu_args+=(
+            "-daemonize"
+            "-display" "none"
+            "-serial" "file:$console_log"
+            "-monitor" "none"
+            "-pidfile" "$pid_file"
+        )
+        
+        # Try to start QEMU, with retry logic for port conflicts
+        local max_retries=5
+        local retry_count=0
+        
+        while [[ $retry_count -lt $max_retries ]]; do
+            if "${qemu_args[@]}" 2>/dev/null; then
+                break
+            else
+                local qemu_error=$?
+                log "QEMU failed to start (exit code: $qemu_error)"
+                
+                # Check if it's likely a port conflict
+                retry_count=$((retry_count + 1))
+                if [[ $retry_count -lt $max_retries ]]; then
+                    log "Attempting retry $retry_count/$max_retries with a different port..."
+                    
+                    # Find a new port
+                    ssh_port=$(find_free_port)
+                    log "Trying new SSH port: $ssh_port"
+                    
+                    # Update the QEMU args with new port
+                    for i in "${!qemu_args[@]}"; do
+                        if [[ "${qemu_args[i]}" =~ ^user,id=n0,hostfwd=tcp:127\.0\.0\.1:[0-9]+-:22$ ]]; then
+                            qemu_args[i]="user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+                            break
+                        fi
+                    done
+                    
+                    # Update the info JSON
+                    cat > "$info_json" <<EOF
+{
+  "name": "$name",
+  "arch": "arm64",
+  "image": "$image",
+  "username": "$username",
+  "password": "$password",
+  "ssh": {
+    "host": "127.0.0.1",
+    "port": $ssh_port
+  }
+}
+EOF
+                    
+                    sleep 1
+                else
+                    error "Failed to start QEMU after $max_retries attempts"
+                fi
+            fi
+        done
+        
+        # Wait for SSH
+        if wait_for_ssh "127.0.0.1" "$ssh_port"; then
+            # Mark first boot as complete after successful SSH connection
+            touch "$first_boot_marker"
+            log "VM $name is ready, just wait some second to ssh service to be available!"
+            echo
+            echo "Connect with: ssh $username@127.0.0.1 -p $ssh_port"
+            echo "Password: $password"
+            #echo "Console log: $console_log"
+        else
+            log "VM started but SSH is not responding"
+            #echo "Check console log: $console_log"
+        fi
+    fi
+}
+
+vm_list() {
+    if [[ ! -d "$VMS_DIR" ]]; then
+        log "No VMs found (VMs directory doesn't exist)"
+        return
+    fi
+    
+    local vm_count=0
+    echo
+    printf "%-15s %-10s %-10s %-10s %-15s %-s\n" "NAME" "STATUS" "ARCH" "IMAGE" "SSH" "CREDENTIALS"
+    printf "%-15s %-10s %-10s %-10s %-15s %-s\n" "----" "------" "----" "-----" "---" "-----------"
+    
+    for vm_dir in "$VMS_DIR"/*; do
+        if [[ ! -d "$vm_dir" ]]; then
+            continue
+        fi
+        
+        local vm_name=$(basename "$vm_dir")
+        local info_file="$vm_dir/info.json"
+        local pid_file="$vm_dir/qemu.pid"
+        
+        if [[ ! -f "$info_file" ]]; then
+            printf "%-15s %-10s %-10s %-10s %-15s %-s\n" "$vm_name" "BROKEN" "-" "-" "-" "-"
+            ((vm_count++))
+            continue
+        fi
+        
+        local status="STOPPED"
+        local ssh_info="-"
+        local credentials="-"
+        
+        # Check if VM is running
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file" 2>/dev/null)
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                status="RUNNING"
+                
+                # Extract info from JSON
+                local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+                local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                
+                ssh_info="127.0.0.1:$port"
+                credentials="$username:$password"
+            else
+                # Clean up stale PID file
+                rm -f "$pid_file"
+            fi
+        fi
+        
+        # Get info from JSON file
+        local arch=$(grep -o '"arch": "[^"]*"' "$info_file" | cut -d'"' -f4)
+        local image=$(grep -o '"image": "[^"]*"' "$info_file" | cut -d'"' -f4)
+        
+        printf "%-15s %-10s %-10s %-10s %-15s %-s\n" "$vm_name" "$status" "${arch:-arm64}" "${image:-unknown}" "$ssh_info" "$credentials"
+        ((vm_count++))
+    done
+    
+    if [[ $vm_count -eq 0 ]]; then
+        echo "No VMs found"
+    else
+        echo
+        echo "Total VMs: $vm_count"
+    fi
+}
+
+vm_start() {
+    local name="$1"
+    local show_console=false
+    
+    [[ -z "$name" ]] && error "VM name is required"
+    
+    # Parse remaining arguments
+    shift
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --show-console)
+                show_console=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    local vm_dir="$VMS_DIR/$name"
+    local info_file="$vm_dir/info.json"
+    local pid_file="$vm_dir/qemu.pid"
+    
+    # Check if VM exists
+    if [[ ! -d "$vm_dir" ]] || [[ ! -f "$info_file" ]]; then
+        error "VM '$name' does not exist"
+    fi
+    
+    # Check if already running
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+            local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+            local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+            error "VM '$name' is already running on port $port (user: $username, pass: $password)"
+        fi
+        # Clean up stale PID file
+        rm -f "$pid_file"
+    fi
+    
+    log "Starting VM: $name"
+    
+    # Extract VM info
+    local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    local ssh_port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+    
+    # Find a free port if the saved one is in use
+    port_check_function() {
+        local test_port=$1
+        
+        # First check with lsof
+        if command -v lsof >/dev/null 2>&1; then
+            if lsof -i ":$test_port" >/dev/null 2>&1; then
+                return 1
+            fi
+        fi
+        
+        # Also check with netstat
+        if command -v netstat >/dev/null 2>&1; then
+            if netstat -an 2>/dev/null | grep -q "\\.$test_port " || netstat -an 2>/dev/null | grep -q ":$test_port "; then
+                return 1
+            fi
+        fi
+        
+        return 0
+    }
+    
+    if ! port_check_function "$ssh_port"; then
+        log "Saved SSH port $ssh_port is in use, finding new port..."
+        ssh_port=$(find_free_port)
+        log "Using new SSH port: $ssh_port"
+        
+        # Update info.json with new port
+        local temp_json=$(mktemp)
+        sed "s/\"port\": [0-9]*/\"port\": $ssh_port/" "$info_file" > "$temp_json"
+        mv "$temp_json" "$info_file"
+    fi
+    
+    # Get VM files
+    local vm_disk="$vm_dir/disk.qcow2"
+    local seed_iso="$vm_dir/seed.iso"
+    
+    if [[ ! -f "$vm_disk" ]]; then
+        error "VM disk not found: $vm_disk"
+    fi
+    
+    # Detect firmware
+    local firmware
+    firmware=$(detect_firmware)
+    
+    # Build QEMU command
+    local qemu_args=(
+        "qemu-system-aarch64"
+        "-machine" "virt"
+        "-cpu" "max"
+        "-bios" "$firmware"
+        "-m" "2G"
+        "-smp" "2"
+        "-name" "$name"
+        "-device" "virtio-net-pci,netdev=n0"
+        "-netdev" "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+        "-device" "virtio-rng-pci"
+        "-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
+    )
+    
+    # Only add cloud-init for fresh VMs (check if this is first boot)
+    # We determine this by checking if the VM has been booted before
+    local first_boot_marker="$vm_dir/.first_boot_complete"
+    if [[ -f "$seed_iso" ]] && [[ ! -f "$first_boot_marker" ]]; then
+        qemu_args+=("-cdrom" "$seed_iso")
+    fi
+    
+    # Add acceleration if available
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        qemu_args+=("-accel" "hvf")
+    fi
+    
+    # Add console/display options
+    if [[ "$show_console" == true ]]; then
+        qemu_args+=("-nographic" "-serial" "mon:stdio" "-monitor" "none")
+        log "Starting VM with console (Ctrl+A then X to quit)"
+        log "Credentials: $username / $password"
+        log "SSH command: ssh $username@127.0.0.1 -p $ssh_port"
+        read -p "Press Enter to start..."
+        exec "${qemu_args[@]}"
+    else
+        local console_log="$vm_dir/console.log"
+        qemu_args+=(
+            "-daemonize"
+            "-display" "none"
+            "-serial" "file:$console_log"
+            "-monitor" "none"
+            "-pidfile" "$pid_file"
+        )
+        
+        if "${qemu_args[@]}" 2>/dev/null; then
+            if wait_for_ssh "127.0.0.1" "$ssh_port"; then
+                # Mark first boot as complete after successful SSH connection (if it was first boot)
+                if [[ ! -f "$first_boot_marker" ]]; then
+                    touch "$first_boot_marker"
+                fi
+                log "VM is ready!"
+                echo
+                echo "Connect with: ssh $username@127.0.0.1 -p $ssh_port"
+                echo "Password: $password"
+                echo "Console log: $console_log"
+            else
+                log "VM started but SSH is not responding"
+                echo "Check console log: $console_log"
+            fi
+        else
+            error "Failed to start VM"
+        fi
+    fi
+}
+
+vm_stop() {
+    local name="$1"
+    
+    [[ -z "$name" ]] && error "VM name is required"
+    
+    local vm_dir="$VMS_DIR/$name"
+    local pid_file="$vm_dir/qemu.pid"
+    
+    # Check if VM exists
+    if [[ ! -d "$vm_dir" ]]; then
+        error "VM '$name' does not exist"
+    fi
+    
+    # Check if VM is running
+    if [[ ! -f "$pid_file" ]]; then
+        log "VM '$name' is not running"
+        return
+    fi
+    
+    local pid=$(cat "$pid_file" 2>/dev/null)
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        log "VM '$name' is not running (cleaning up stale PID file)"
+        rm -f "$pid_file"
+        return
+    fi
+    
+    log "Stopping VM: $name (PID: $pid)"
+    
+    # Try graceful shutdown first
+    if kill -TERM "$pid" 2>/dev/null; then
+        local count=0
+        local timeout=30
+        
+        log "Sending graceful shutdown signal..."
+        while [[ $count -lt $timeout ]] && kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+            ((count++))
+        done
+        
+        if kill -0 "$pid" 2>/dev/null; then
+            log "Graceful shutdown timed out, forcing stop..."
+            kill -KILL "$pid" 2>/dev/null
+            sleep 2
+        fi
+        
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log "VM stopped successfully"
+            rm -f "$pid_file"
+        else
+            error "Failed to stop VM"
+        fi
+    else
+        error "Failed to send stop signal to VM"
+    fi
+}
+
+vm_delete() {
+    local name="$1"
+    local force=false
+    
+    [[ -z "$name" ]] && error "VM name is required"
+    
+    # Parse remaining arguments
+    shift
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --force)
+                force=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    local vm_dir="$VMS_DIR/$name"
+    
+    # Check if VM exists
+    if [[ ! -d "$vm_dir" ]]; then
+        error "VM '$name' does not exist"
+    fi
+    
+    # Check if VM is running and stop it
+    local pid_file="$vm_dir/qemu.pid"
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log "Stopping running VM before deletion..."
+            vm_stop "$name"
+        fi
+    fi
+    
+    # Confirm deletion
+    if [[ "$force" == false ]]; then
+        echo "This will permanently delete VM '$name' and all its data."
+        read -p "Are you sure? (y/N): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            log "Deletion cancelled"
+            return
+        fi
+    fi
+    
+    log "Deleting VM: $name"
+    rm -rf "$vm_dir"
+    log "VM '$name' deleted successfully"
+}
+
+main() {
+    local entity="${1:-}"
+    local command="${2:-}"
+    
+    case "$entity" in
+        vm)
+            shift 2
+            case "$command" in
+                create)
+                    check_dependencies
+                    mkdir -p "$IMAGES_DIR" "$VMS_DIR"
+                    vm_create "$@"
+                    ;;
+                list)
+                    mkdir -p "$VMS_DIR"
+                    vm_list
+                    ;;
+                start)
+                    check_dependencies
+                    vm_start "$@"
+                    ;;
+                stop)
+                    vm_stop "$@"
+                    ;;
+                delete)
+                    vm_delete "$@"
+                    ;;
+                *)
+                    error "Unknown VM command: $command"
+                    ;;
+            esac
+            ;;
+        image)
+            shift 2
+            case "$command" in
+                list)
+                    mkdir -p "$IMAGES_DIR"
+                    image_list
+                    ;;
+                pull)
+                    check_dependencies
+                    mkdir -p "$IMAGES_DIR"
+                    image_pull "$@"
+                    ;;
+                delete)
+                    image_delete "$@"
+                    ;;
+                *)
+                    error "Unknown image command: $command"
+                    ;;
+            esac
+            ;;
+        --help|-h|help|"")
+            usage
+            ;;
+        *)
+            error "Unknown entity: $entity"
+            ;;
+    esac
+}
+
+main "$@"
