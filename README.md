@@ -26,7 +26,7 @@ Install Homebrew if you don't have it:
 
 ```bash
 # Download, make executable, and install
-curl -o linux https://raw.githubusercontent.com/antoniopicone/lazylinux/linux
+curl -o linux https://raw.githubusercontent.com/antoniopicone/lazylinux/refs/heads/main/linux
 chmod +x linux
 sudo mv linux /usr/local/bin/
 ```
