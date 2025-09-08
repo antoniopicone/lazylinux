@@ -1,11 +1,12 @@
 # Linux VM CLI
 
-A simple command-line tool for creating and managing ARM64 Linux virtual machines on macOS using QEMU.
+A simple command-line tool for creating and managing Linux virtual machines on macOS using QEMU.
 
 ## Features
 
 - **Easy VM Management**: Create, start, stop, and delete VMs with simple commands
 - **Image Management**: Download and manage cloud images (Debian 12, for now)
+- **Virtualization & Emulation**: Support both ARM and AMD architectures
 - **Automatic Setup**: Cloud-init configuration with SSH access
 - **Port Management**: Automatic SSH port assignment with conflict resolution
 - **Persistent Storage**: VM state preserved across restarts
@@ -77,6 +78,16 @@ linux image list
 linux image delete debian12
 ```
 
+### 4. System cleanup
+
+```bash
+# Purge all VMs and downloaded images (interactive confirmation)
+linux purge
+
+# Purge without confirmation
+linux purge --force
+```
+
 ## Usage
 
 ### VM Commands
@@ -126,6 +137,16 @@ linux image pull IMAGE_NAME
 linux image delete IMAGE_NAME
 ```
 
+### System Commands
+
+```bash
+# Delete ALL VMs and downloaded images (asks for confirmation)
+linux purge
+
+# Force purge without confirmation
+linux purge --force
+```
+
 ### Available Images
 
 | Image | Description |
@@ -168,6 +189,13 @@ linux image list
 
 # Clean up unused images
 linux image delete debian12
+```
+
+### System Maintenance
+
+```bash
+# Completely reset the CLI state (remove all VMs and images)
+linux purge --force
 ```
 
 ## Directory Structure
