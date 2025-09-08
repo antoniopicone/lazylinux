@@ -46,6 +46,9 @@ linux vm create --name myvm
 
 # Create a VM with custom specifications
 linux vm create --name myvm --memory 4G --cpus 4 --disk 20G
+
+# Create an x86_64 (amd64) VM (emulated on Apple Silicon)
+linux vm create --name myvm-amd64 --arch amd64
 ```
 
 ### 2. Manage VMs
@@ -100,6 +103,7 @@ linux vm delete VM_NAME
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--name NAME` | VM name (required) | - |
+| `--arch ARCH` | Architecture (`arm64`, `amd64`) | arm64 |
 | `--image IMAGE` | Base image | debian12 |
 | `--user USERNAME` | Username | user01 |
 | `--pass PASSWORD` | Password | auto-generated |
@@ -138,6 +142,9 @@ linux vm create --name dev
 
 # Create a VM with custom credentials
 linux vm create --name secure --user admin --pass mypassword
+
+# Create an amd64 VM instead of the default arm64
+linux vm create --name dev-amd64 --arch amd64
 ```
 
 ### Working with VMs
