@@ -12,9 +12,16 @@ DEFAULT_CPUS="2"
 DEFAULT_DISK="10G"
 
 get_image_url() {
-    case "$1" in
+    local image_name="$1"
+    local arch="${2:-arm64}"
+    
+    case "$image_name" in
         debian12)
-            echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2"
+            if [[ "$arch" == "amd64" || "$arch" == "x86_64" ]]; then
+                echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+            else
+                echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2"
+            fi
             ;;
         *)
             return 1
@@ -29,6 +36,7 @@ get_available_images() {
 # Required binaries
 REQUIRED_BINS=(
     "qemu-system-aarch64"
+    "qemu-system-x86_64"
     "qemu-img"
     "hdiutil"
 )
@@ -47,15 +55,23 @@ VM Commands:
     start VM_NAME       Start an existing VM
     stop VM_NAME        Stop a running VM
     delete VM_NAME      Delete a VM and its files
+    help                Show detailed VM help
 
 Image Commands:
     list                List available and downloaded images
-    pull IMAGE_NAME     Download an image (e.g., debian12, ubuntu22, ubuntu24)
-    delete IMAGE_NAME   Delete a downloaded image
+    pull IMAGE_NAME     Download an image (e.g., debian12-arm64, debian12-amd64)
+    delete IMAGE_NAME   Delete a downloaded image (e.g., debian12-arm64)
+                        --force         Delete without confirmation
+    help                Show detailed image help
+
+System Commands:
+    purge               Delete all VMs and downloaded images
+                        --force         Purge without confirmation
 
 VM Create options:
     --name NAME         VM name (required)
     --image IMAGE       Base image (default: debian12, options: debian12, ubuntu22, ubuntu24)
+    --arch ARCH         Architecture (default: arm64, options: arm64, amd64)
     --user USERNAME     Username (default: $DEFAULT_USERNAME)
     --pass PASSWORD     Password (default: auto-generated)
     --memory SIZE       Memory size (default: $DEFAULT_MEMORY)
@@ -65,15 +81,14 @@ VM Create options:
     --show-console      Show console output
 
 Examples:
-    $0 image pull debian12
-    $0 vm create --name myvm --memory 4G --cpus 4
-    $0 vm create --name myvm --image ubuntu22 --memory 4G --cpus 4
+    $0 vm help                    # Show detailed VM help
+    $0 image help                 # Show detailed image help
+    $0 vm create --name myvm --arch amd64 --memory 4G
     $0 vm list
     $0 vm start myvm
-    $0 vm stop myvm
-    $0 vm delete myvm
+    $0 image pull debian12-arm64
     $0 image list
-    $0 image delete debian12
+    $0 purge --force
 EOF
 }
 
@@ -188,14 +203,15 @@ find_free_port() {
 
 download_image() {
     local image_name="$1"
+    local arch="${2:-arm64}"
     local url
-    url=$(get_image_url "$image_name")
+    url=$(get_image_url "$image_name" "$arch")
     
     if [[ -z "$url" ]]; then
         error "Unknown image: $image_name. Available: $(get_available_images)"
     fi
     
-    local filename="${image_name}.qcow2"
+    local filename="${image_name}-${arch}.qcow2"
     local dest="$IMAGES_DIR/$filename"
     
     if [[ -f "$dest" ]]; then
@@ -203,19 +219,44 @@ download_image() {
         return
     fi
     
-    log "Downloading $image_name image..."
+    log "Downloading $image_name image..." >&2
     mkdir -p "$IMAGES_DIR"
     
     # Download to temporary file first
     local temp_file="$dest.tmp"
-    if curl -L -o "$temp_file" "$url"; then
+    if curl -L -s -f -o "$temp_file" "$url"; then
+        # Verify the download completed successfully
+        if [[ ! -s "$temp_file" ]]; then
+            rm -f "$temp_file"
+            error "Downloaded file is empty: $image_name"
+        fi
+        
         # Convert to qcow2 if needed
         if [[ "$url" == *.img ]]; then
-            qemu-img convert -O qcow2 "$temp_file" "$dest"
-            rm "$temp_file"
+            if qemu-img convert -O qcow2 "$temp_file" "$dest"; then
+                rm "$temp_file"
+                # Sync to ensure file is written to disk
+                sync
+            else
+                rm -f "$temp_file" "$dest"
+                error "Failed to convert image: $image_name"
+            fi
         else
-            mv "$temp_file" "$dest"
+            if mv "$temp_file" "$dest"; then
+                # Sync to ensure file is written to disk
+                sync
+            else
+                rm -f "$temp_file"
+                error "Failed to move image file: $image_name"
+            fi
         fi
+        
+        # Verify the final image file is valid
+        if ! qemu-img info "$dest" >/dev/null 2>&1; then
+            rm -f "$dest"
+            error "Downloaded image is not a valid QEMU image: $image_name"
+        fi
+        
         echo "$dest"
     else
         rm -f "$temp_file"
@@ -299,6 +340,14 @@ EOF
 }
 
 detect_firmware() {
+    local arch="${1:-arm64}"
+    
+    if [[ "$arch" == "amd64" ]]; then
+        # x86_64 doesn't need explicit BIOS path, uses default
+        return 0
+    fi
+    
+    # ARM64 firmware candidates
     local candidates=(
         "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
         "/usr/local/share/qemu/edk2-aarch64-code.fd"
@@ -340,82 +389,112 @@ wait_for_ssh() {
 # Image management functions
 image_list() {
     echo
-    printf "%-15s %-10s %-s\n" "IMAGE" "STATUS" "URL"
-    printf "%-15s %-10s %-s\n" "-----" "------" "---"
+    printf "%-20s %-15s %-s\n" "IMAGE" "STATUS" "URL"
+    printf "%-20s %-15s %-s\n" "-----" "------" "---"
     
     for image_name in $(get_available_images); do
-        local filename="${image_name}.qcow2"
-        local image_path="$IMAGES_DIR/$filename"
-        local status="AVAILABLE"
-        
-        if [[ -f "$image_path" ]]; then
-            local size=$(du -h "$image_path" | cut -f1)
-            status="DOWNLOADED ($size)"
-        fi
-        
-        local url
-        url=$(get_image_url "$image_name")
-        printf "%-15s %-10s %-s\n" "$image_name" "$status" "$url"
+        for arch in "arm64" "amd64"; do
+            local filename="${image_name}-${arch}.qcow2"
+            local image_path="$IMAGES_DIR/$filename"
+            local status="AVAILABLE"
+            
+            if [[ -f "$image_path" ]]; then
+                local size=$(du -h "$image_path" | cut -f1)
+                status="DOWNLOADED ($size)"
+            fi
+            
+            local url
+            url=$(get_image_url "$image_name" "$arch")
+            printf "%-20s %-15s %-s\n" "${image_name}-${arch}" "$status" "$url"
+        done
     done
     echo
 }
 
 image_pull() {
-    local image_name="$1"
-    [[ -z "$image_name" ]] && error "Image name is required"
+    local image_spec="$1"
+    [[ -z "$image_spec" ]] && error "Image name is required"
+    
+    local image_name arch
+    
+    # Parse image spec (e.g., "debian12-amd64" or "debian12")
+    if [[ "$image_spec" =~ ^(.+)-(arm64|amd64)$ ]]; then
+        image_name="${BASH_REMATCH[1]}"
+        arch="${BASH_REMATCH[2]}"
+    else
+        image_name="$image_spec"
+        arch="arm64"  # Default architecture
+    fi
     
     local url
-    url=$(get_image_url "$image_name")
+    url=$(get_image_url "$image_name" "$arch")
     if [[ -z "$url" ]]; then
         error "Unknown image: $image_name. Available: $(get_available_images)"
     fi
     
-    download_image "$image_name" >/dev/null
-    log "Image $image_name downloaded successfully"
+    download_image "$image_name" "$arch" >/dev/null
+    log "Image ${image_name}-${arch} downloaded successfully"
 }
 
 image_delete() {
-    local image_name="$1"
-    [[ -z "$image_name" ]] && error "Image name is required"
+    local image_spec="$1"
+    local force=false
     
-    local filename="${image_name}.qcow2"
+    [[ -z "$image_spec" ]] && error "Image name is required"
+    
+    # Parse remaining arguments
+    shift
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --force)
+                force=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    local image_name arch
+    
+    # Parse image spec (e.g., "debian12-amd64" or "debian12")
+    if [[ "$image_spec" =~ ^(.+)-(arm64|amd64)$ ]]; then
+        image_name="${BASH_REMATCH[1]}"
+        arch="${BASH_REMATCH[2]}"
+    else
+        # If no architecture specified, show error with available options
+        error "Please specify architecture. Example: $image_spec-arm64 or $image_spec-amd64"
+    fi
+    
+    local filename="${image_name}-${arch}.qcow2"
     local image_path="$IMAGES_DIR/$filename"
     
     if [[ ! -f "$image_path" ]]; then
-        error "Image $image_name is not downloaded"
+        error "Image ${image_name}-${arch} is not downloaded"
     fi
     
-    # Check if any VMs are using this image
-    if [[ -d "$VMS_DIR" ]]; then
-        for vm_dir in "$VMS_DIR"/*; do
-            if [[ -d "$vm_dir" ]]; then
-                local info_file="$vm_dir/info.json"
-                if [[ -f "$info_file" ]]; then
-                    local vm_image=$(grep -o '"image": "[^"]*"' "$info_file" 2>/dev/null | cut -d'"' -f4)
-                    if [[ "$vm_image" == "$image_name" ]]; then
-                        local vm_name=$(basename "$vm_dir")
-                        error "Cannot delete image $image_name: still used by VM '$vm_name'"
-                    fi
-                fi
-            fi
-        done
-    fi
+    # Note: VMs have their own independent disk copies, so base images can always be deleted
     
-    echo "This will permanently delete the downloaded image '$image_name'."
-    read -p "Are you sure? (y/N): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        log "Deletion cancelled"
-        return
+    # Confirm deletion
+    if [[ "$force" == false ]]; then
+        echo "This will permanently delete the downloaded image '${image_name}-${arch}'."
+        read -p "Are you sure? (y/N): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            log "Deletion cancelled"
+            return
+        fi
     fi
     
     rm -f "$image_path"
-    log "Image $image_name deleted successfully"
+    log "Image ${image_name}-${arch} deleted successfully"
 }
 
 # VM management functions
 vm_create() {
     local name=""
     local image=""
+    local arch="arm64"
     local username="$DEFAULT_USERNAME"
     local password=""
     local memory="$DEFAULT_MEMORY"
@@ -433,6 +512,10 @@ vm_create() {
                 ;;
             --image)
                 image="$2"
+                shift 2
+                ;;
+            --arch)
+                arch="$2"
                 shift 2
                 ;;
             --user)
@@ -471,6 +554,15 @@ vm_create() {
     
     [[ -z "$name" ]] && error "--name is required"
     [[ -z "$image" ]] && image="debian12"
+    
+    # Validate architecture
+    if [[ "$arch" != "arm64" && "$arch" != "amd64" && "$arch" != "x86_64" ]]; then
+        error "Invalid architecture: $arch. Options: arm64, amd64"
+    fi
+    
+    # Normalize architecture
+    [[ "$arch" == "x86_64" ]] && arch="amd64"
+    
     [[ -z "$password" ]] && password=$(generate_password 16)
     [[ -z "$ssh_port" ]] && ssh_port=$(find_free_port)
     
@@ -501,29 +593,48 @@ vm_create() {
     
     # Download base image
     local base_image
-    base_image=$(download_image "$image")
+    base_image=$(download_image "$image" "$arch")
     
     # Create VM disk
     local vm_disk="$vm_dir/disk.qcow2"
     if [[ ! -f "$vm_disk" ]]; then
-        qemu-img convert -O qcow2 "$base_image" "$vm_disk"
-        qemu-img resize "$vm_disk" "$disk" >/dev/null
+        log "Creating VM disk from base image..." >&2
+        if qemu-img convert -O qcow2 "$base_image" "$vm_disk"; then
+            if qemu-img resize "$vm_disk" "$disk" >/dev/null; then
+                # Sync to ensure VM disk is written to disk
+                sync
+                # Verify the VM disk is valid
+                if ! qemu-img info "$vm_disk" >/dev/null 2>&1; then
+                    rm -f "$vm_disk"
+                    error "Failed to create valid VM disk for: $name"
+                fi
+                log "VM disk created successfully" >&2
+            else
+                rm -f "$vm_disk"
+                error "Failed to resize VM disk for: $name"
+            fi
+        else
+            rm -f "$vm_disk"
+            error "Failed to create VM disk from base image for: $name"
+        fi
     fi
     
     # Create cloud-init seed
     local seed_iso
     seed_iso=$(create_cloud_init "$vm_dir" "$username" "$password" "$name")
     
-    # Detect firmware
-    local firmware
-    firmware=$(detect_firmware)
+    # Detect firmware for ARM64
+    local firmware=""
+    if [[ "$arch" == "arm64" ]]; then
+        firmware=$(detect_firmware "$arch")
+    fi
     
     # Save VM info
     local info_json="$vm_dir/info.json"
     cat > "$info_json" <<EOF
 {
   "name": "$name",
-  "arch": "arm64",
+  "arch": "$arch",
   "image": "$image",
   "username": "$username",
   "password": "$password",
@@ -534,27 +645,48 @@ vm_create() {
 }
 EOF
     
-    # Build QEMU command
-    local qemu_args=(
-        "qemu-system-aarch64"
-        "-machine" "virt"
-        "-cpu" "max"
-        "-bios" "$firmware"
-        "-m" "$memory"
-        "-smp" "$cpus"
-        "-name" "$name"
-        "-device" "virtio-net-pci,netdev=n0"
-        "-netdev" "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
-        "-device" "virtio-rng-pci"
-        "-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
-    )
+    # Build QEMU command based on architecture
+    local qemu_args=()
+    
+    if [[ "$arch" == "amd64" ]]; then
+        # x86_64 configuration
+        qemu_args=(
+            "qemu-system-x86_64"
+            "-machine" "q35"
+            "-cpu" "qemu64"
+            "-m" "$memory"
+            "-smp" "$cpus"
+            "-object" "memory-backend-ram,id=mem,size=$memory"
+            "-numa" "node,memdev=mem"
+            "-name" "$name"
+            "-device" "virtio-net-pci,netdev=n0"
+            "-netdev" "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+            "-device" "virtio-rng-pci"
+            "-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
+        )
+    else
+        # ARM64 configuration
+        qemu_args=(
+            "qemu-system-aarch64"
+            "-machine" "virt"
+            "-cpu" "max"
+            "-bios" "$firmware"
+            "-m" "$memory"
+            "-smp" "$cpus"
+            "-name" "$name"
+            "-device" "virtio-net-pci,netdev=n0"
+            "-netdev" "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+            "-device" "virtio-rng-pci"
+            "-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
+        )
+    fi
     
     # Add cloud-init for first boot only
     local first_boot_marker="$vm_dir/.first_boot_complete"
     qemu_args+=("-cdrom" "$seed_iso")
     
-    # Add acceleration if available
-    if [[ "$OSTYPE" == "darwin"* ]]; then
+    # Add acceleration if available (only for ARM64 on macOS)
+    if [[ "$OSTYPE" == "darwin"* && "$arch" == "arm64" ]]; then
         qemu_args+=("-accel" "hvf")
     fi
     
@@ -609,7 +741,7 @@ EOF
                     cat > "$info_json" <<EOF
 {
   "name": "$name",
-  "arch": "arm64",
+  "arch": "$arch",
   "image": "$image",
   "username": "$username",
   "password": "$password",
@@ -797,24 +929,51 @@ vm_start() {
         error "VM disk not found: $vm_disk"
     fi
     
-    # Detect firmware
-    local firmware
-    firmware=$(detect_firmware)
+    # Get architecture from VM info
+    local arch=$(grep -o '"arch": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    [[ -z "$arch" ]] && arch="arm64"  # Default to arm64 for backward compatibility
     
-    # Build QEMU command
-    local qemu_args=(
-        "qemu-system-aarch64"
-        "-machine" "virt"
-        "-cpu" "max"
-        "-bios" "$firmware"
-        "-m" "2G"
-        "-smp" "2"
-        "-name" "$name"
-        "-device" "virtio-net-pci,netdev=n0"
-        "-netdev" "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
-        "-device" "virtio-rng-pci"
-        "-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
-    )
+    # Detect firmware for ARM64
+    local firmware=""
+    if [[ "$arch" == "arm64" ]]; then
+        firmware=$(detect_firmware "$arch")
+    fi
+    
+    # Build QEMU command based on architecture
+    local qemu_args=()
+    
+    if [[ "$arch" == "amd64" ]]; then
+        # x86_64 configuration
+        qemu_args=(
+            "qemu-system-x86_64"
+            "-machine" "q35"
+            "-cpu" "qemu64"
+            "-m" "2G"
+            "-smp" "2"
+            "-object" "memory-backend-ram,id=mem,size=2G"
+            "-numa" "node,memdev=mem"
+            "-name" "$name"
+            "-device" "virtio-net-pci,netdev=n0"
+            "-netdev" "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+            "-device" "virtio-rng-pci"
+            "-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
+        )
+    else
+        # ARM64 configuration
+        qemu_args=(
+            "qemu-system-aarch64"
+            "-machine" "virt"
+            "-cpu" "max"
+            "-bios" "$firmware"
+            "-m" "2G"
+            "-smp" "2"
+            "-name" "$name"
+            "-device" "virtio-net-pci,netdev=n0"
+            "-netdev" "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+            "-device" "virtio-rng-pci"
+            "-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
+        )
+    fi
     
     # Only add cloud-init for fresh VMs (check if this is first boot)
     # We determine this by checking if the VM has been booted before
@@ -823,8 +982,8 @@ vm_start() {
         qemu_args+=("-cdrom" "$seed_iso")
     fi
     
-    # Add acceleration if available
-    if [[ "$OSTYPE" == "darwin"* ]]; then
+    # Add acceleration if available (only for ARM64 on macOS)
+    if [[ "$OSTYPE" == "darwin"* && "$arch" == "arm64" ]]; then
         qemu_args+=("-accel" "hvf")
     fi
     
@@ -975,13 +1134,215 @@ vm_delete() {
     log "VM '$name' deleted successfully"
 }
 
+purge() {
+    local force=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --force)
+                force=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    # Count what will be deleted
+    local vm_count=0
+    local image_count=0
+    
+    # Count VMs
+    if [[ -d "$VMS_DIR" ]]; then
+        for vm_dir in "$VMS_DIR"/*; do
+            if [[ -d "$vm_dir" ]]; then
+                ((vm_count++))
+            fi
+        done
+    fi
+    
+    # Count downloaded images
+    if [[ -d "$IMAGES_DIR" ]]; then
+        for image_file in "$IMAGES_DIR"/*.qcow2; do
+            if [[ -f "$image_file" ]]; then
+                ((image_count++))
+            fi
+        done
+    fi
+    
+    # Show what will be deleted
+    if [[ $vm_count -eq 0 && $image_count -eq 0 ]]; then
+        log "Nothing to purge - no VMs or downloaded images found"
+        return
+    fi
+    
+    log "Purge will delete:"
+    [[ $vm_count -gt 0 ]] && log "  - $vm_count VM(s) and their data"
+    [[ $image_count -gt 0 ]] && log "  - $image_count downloaded image(s)"
+    
+    # Confirm purge
+    if [[ "$force" == false ]]; then
+        echo
+        echo "WARNING: This will permanently delete ALL VMs and downloaded images!"
+        echo "This action cannot be undone."
+        read -p "Are you absolutely sure? (y/N): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            log "Purge cancelled"
+            return
+        fi
+    fi
+    
+    log "Starting purge operation..."
+    
+    # Stop and delete all VMs
+    if [[ $vm_count -gt 0 ]]; then
+        log "Deleting $vm_count VMs..."
+        for vm_dir in "$VMS_DIR"/*; do
+            if [[ -d "$vm_dir" ]]; then
+                local vm_name=$(basename "$vm_dir")
+                log "  Deleting VM: $vm_name"
+                
+                # Stop VM if running
+                local pid_file="$vm_dir/qemu.pid"
+                if [[ -f "$pid_file" ]]; then
+                    local pid=$(cat "$pid_file" 2>/dev/null)
+                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                        log "    Stopping running VM..."
+                        kill -TERM "$pid" 2>/dev/null || true
+                        sleep 2
+                        kill -KILL "$pid" 2>/dev/null || true
+                    fi
+                fi
+                
+                # Delete VM directory
+                rm -rf "$vm_dir"
+            fi
+        done
+        
+        # Remove empty VMs directory
+        [[ -d "$VMS_DIR" && -z "$(ls -A "$VMS_DIR" 2>/dev/null)" ]] && rmdir "$VMS_DIR"
+    fi
+    
+    # Delete all downloaded images
+    if [[ $image_count -gt 0 ]]; then
+        log "Deleting $image_count downloaded images..."
+        for image_file in "$IMAGES_DIR"/*.qcow2; do
+            if [[ -f "$image_file" ]]; then
+                local image_name=$(basename "$image_file")
+                log "  Deleting image: $image_name"
+                rm -f "$image_file"
+            fi
+        done
+        
+        # Remove empty images directory
+        [[ -d "$IMAGES_DIR" && -z "$(ls -A "$IMAGES_DIR" 2>/dev/null)" ]] && rmdir "$IMAGES_DIR"
+    fi
+    
+    # Remove empty root directory if both subdirs are gone
+    if [[ -d "$WORK_ROOT" && -z "$(ls -A "$WORK_ROOT" 2>/dev/null)" ]]; then
+        rmdir "$WORK_ROOT"
+    fi
+    
+    log "Purge completed successfully!"
+    log "Deleted $vm_count VM(s) and $image_count image(s)"
+}
+
+vm_help() {
+    cat <<EOF
+VM Commands Help:
+
+USAGE:
+    $0 vm COMMAND [options]
+
+COMMANDS:
+    create              Create and start a new VM
+    list                List all VMs and their status
+    start VM_NAME       Start an existing VM
+    stop VM_NAME        Stop a running VM  
+    delete VM_NAME      Delete a VM and its files
+    help                Show this help message
+
+CREATE OPTIONS:
+    --name NAME         VM name (required)
+    --image IMAGE       Base image (default: debian12)
+    --arch ARCH         Architecture: arm64, amd64 (default: arm64)
+    --user USERNAME     Username (default: $DEFAULT_USERNAME)
+    --pass PASSWORD     Password (default: auto-generated)
+    --memory SIZE       Memory size (default: $DEFAULT_MEMORY)
+    --cpus COUNT        CPU count (default: $DEFAULT_CPUS)
+    --disk SIZE         Disk size (default: $DEFAULT_DISK)
+    --ssh-port PORT     SSH port (default: auto-assign)
+    --show-console      Show console output
+
+START OPTIONS:
+    --show-console      Show console output
+
+DELETE OPTIONS:
+    --force             Delete without confirmation
+
+EXAMPLES:
+    $0 vm create --name myvm
+    $0 vm create --name myvm --arch amd64 --memory 4G --cpus 4
+    $0 vm create --name myvm --image debian12 --user admin --pass mypass
+    $0 vm list
+    $0 vm start myvm
+    $0 vm start myvm --show-console
+    $0 vm stop myvm
+    $0 vm delete myvm
+    $0 vm delete myvm --force
+
+NOTES:
+    - VMs have independent disk copies, so deleting base images won't affect running VMs
+    - ARM64 VMs use HVF acceleration on macOS, x86_64 VMs run in emulation mode
+    - SSH credentials are shown after VM creation and in 'vm list' output
+EOF
+}
+
+image_help() {
+    cat <<EOF
+Image Commands Help:
+
+USAGE:
+    $0 image COMMAND [options]
+
+COMMANDS:
+    list                List available and downloaded images
+    pull IMAGE_NAME     Download an image
+    delete IMAGE_NAME   Delete a downloaded image  
+    help                Show this help message
+
+AVAILABLE IMAGES:
+    debian12-arm64      Debian 12 for ARM64 architecture
+    debian12-amd64      Debian 12 for x86_64 architecture
+
+DELETE OPTIONS:
+    --force             Delete without confirmation
+
+EXAMPLES:
+    $0 image list
+    $0 image pull debian12-arm64
+    $0 image pull debian12-amd64
+    $0 image delete debian12-arm64
+    $0 image delete debian12-amd64 --force
+
+NOTES:
+    - Images are downloaded to ~/.linux_vm_cli/images/
+    - Each VM creates its own independent disk copy from base images
+    - Base images can be safely deleted after VM creation to save space
+    - Images are automatically downloaded when creating VMs if not present
+EOF
+}
+
 main() {
     local entity="${1:-}"
     local command="${2:-}"
     
     case "$entity" in
         vm)
-            shift 2
+            shift
+            [[ $# -gt 0 ]] && shift
             case "$command" in
                 create)
                     check_dependencies
@@ -1002,13 +1363,17 @@ main() {
                 delete)
                     vm_delete "$@"
                     ;;
+                help|--help|-h|"")
+                    vm_help
+                    ;;
                 *)
                     error "Unknown VM command: $command"
                     ;;
             esac
             ;;
         image)
-            shift 2
+            shift
+            [[ $# -gt 0 ]] && shift
             case "$command" in
                 list)
                     mkdir -p "$IMAGES_DIR"
@@ -1022,10 +1387,17 @@ main() {
                 delete)
                     image_delete "$@"
                     ;;
+                help|--help|-h|"")
+                    image_help
+                    ;;
                 *)
                     error "Unknown image command: $command"
                     ;;
             esac
+            ;;
+        purge)
+            shift 1
+            purge "$@"
             ;;
         --help|-h|help|"")
             usage
