@@ -273,7 +273,6 @@ create_cloud_init() {
     local password="$3"
     local hostname="$4"
     local net_type="$5"
-    local vm_ip="$6"
     
     local user_data=$(cat <<EOF
 #cloud-config
@@ -302,12 +301,8 @@ write_files:
         renderer: networkd
         ethernets:
           enp0s1:
-            dhcp4: no
-            addresses:
-              - $vm_ip/24
-            routes:
-              - to: 0.0.0.0/0
-                via: 192.168.105.1
+            dhcp4: yes
+            dhcp6: no
             nameservers:
               addresses: [8.8.8.8, 1.1.1.1]
 NETEOF
@@ -366,6 +361,10 @@ EOF
     local tmpdir=$(mktemp -d)
     echo "$user_data" > "$tmpdir/user-data"
     echo "$meta_data" > "$tmpdir/meta-data"
+    
+    # Save cloud-init config to VM directory for debugging
+    echo "$user_data" > "$vm_dir/cloud-init-user-data.yaml"
+    echo "$meta_data" > "$vm_dir/cloud-init-meta-data.json"
     
     # Create ISO using hdiutil
     if hdiutil makehybrid -o "$seed_iso" -hfs -joliet -iso -default-volume-name "cidata" "$tmpdir" >/dev/null 2>&1; then
@@ -434,6 +433,7 @@ wait_for_ssh() {
     
     return 1
 }
+
 
 # Try to detect the IP address of a bridge mode VM
 detect_bridge_vm_ip() {
@@ -814,32 +814,8 @@ vm_create() {
     fi
     
     # Create cloud-init seed
-    local seed_iso vm_static_ip
-    if [[ "$net_type" == "bridge" ]]; then
-        # Generate static IP for bridge mode - check for conflicts
-        local random_ip
-        local max_attempts=50
-        local attempt=0
-        
-        while [[ $attempt -lt $max_attempts ]]; do
-            random_ip=$((RANDOM % 90 + 10))
-            vm_static_ip="192.168.105.$random_ip"
-            
-            # Check if IP is already in use by another VM
-            if ! grep -r "\"bridge_ip\": \"$vm_static_ip\"" "$VMS_DIR"/*/info.json >/dev/null 2>&1; then
-                # Also ping test to check if IP is in use on network
-                if ! ping -c 1 -W 300 "$vm_static_ip" >/dev/null 2>&1; then
-                    break
-                fi
-            fi
-            ((attempt++))
-        done
-        
-        if [[ $attempt -eq $max_attempts ]]; then
-            error "Could not find available IP address in range 192.168.105.10-99"
-        fi
-    fi
-    seed_iso=$(create_cloud_init "$vm_dir" "$username" "$password" "$name" "$net_type" "$vm_static_ip")
+    local seed_iso
+    seed_iso=$(create_cloud_init "$vm_dir" "$username" "$password" "$name" "$net_type")
     
     # Detect firmware for ARM64
     local firmware=""
@@ -858,9 +834,8 @@ vm_create() {
   "username": "$username",
   "password": "$password",
   "net_type": "$net_type",
-  "bridge_ip": "$vm_static_ip",
   "ssh": {
-    "host": "$vm_static_ip",
+    "host": "dhcp-assigned",
     "port": 22
   }
 }
@@ -909,6 +884,19 @@ EOF
         echo "VM Disk: $vm_disk"
         echo "Seed ISO: $seed_iso"
         [[ -n "$firmware" ]] && echo "Firmware: $firmware"
+        echo
+        echo "Cloud-Init Configuration:"
+        echo "------------------------"
+        if [[ -f "$vm_dir/cloud-init-user-data.yaml" ]]; then
+            echo "User Data:"
+            cat "$vm_dir/cloud-init-user-data.yaml"
+            echo
+            echo "Meta Data:"
+            cat "$vm_dir/cloud-init-meta-data.json"
+        else
+            echo "Cloud-init config files not found"
+        fi
+        echo "------------------------"
         echo
         echo "QEMU Command:"
         printf "%s " "${qemu_args[@]}"
@@ -1020,9 +1008,9 @@ EOF
             echo
             echo "Network mode: VMNet Shared Bridge"
             echo "VM has internet access and shares host network"
-            echo "VM IP: $vm_static_ip (static IP with modern netplan)"
+            echo "VM IP: DHCP-assigned (use './linux vm ip $name' to find IP)"
             echo "Credentials: $username / $password"
-            echo "Note: SSH with: ssh $username@$vm_static_ip"
+            echo "Note: VM will get IP via DHCP - check with './linux vm ip $name'"
         else
             if wait_for_ssh "127.0.0.1" "$ssh_port"; then
                 # Mark first boot as complete after successful SSH connection
@@ -1103,9 +1091,8 @@ vm_list() {
             [[ -z "$net_type" ]] && net_type="portfwd"
             
             if [[ "$net_type" == "bridge" ]]; then
-                # For bridge mode, show the static bridge IP
-                local bridge_ip=$(grep -o '"bridge_ip": "[^"]*"' "$info_file" | cut -d'"' -f4)
-                ssh_info="${bridge_ip:-bridge (use 'vm ip $vm_name')}"
+                # For bridge mode, show DHCP status
+                ssh_info="bridge-dhcp (use './linux vm ip $vm_name')"
             else
                 ssh_info="127.0.0.1:$port"
             fi
@@ -1325,10 +1312,10 @@ vm_start() {
                 log "VM $name is ready with bridge networking!"
                 echo
                 echo "Network mode: VMNet Shared Bridge"
-                echo "VM IP: $vm_static_ip (static IP with modern netplan)"
+                echo "VM IP: DHCP-assigned (use './linux vm ip $name' to find IP)"
                 echo "Credentials: $username / $password"
                 echo "Console log: $console_log"
-                echo "Note: SSH with: ssh $username@$vm_static_ip"
+                echo "Note: VM will get IP via DHCP - check with './linux vm ip $name'"
             else
                 if wait_for_ssh "127.0.0.1" "$ssh_port"; then
                     # Mark first boot as complete after successful SSH connection (if it was first boot)
