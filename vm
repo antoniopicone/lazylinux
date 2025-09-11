@@ -1,0 +1,1693 @@
+#!/bin/bash
+
+set -e
+
+# Configuration
+WORK_ROOT="$HOME/.vm"
+IMAGES_DIR="$WORK_ROOT/images"
+VMS_DIR="$WORK_ROOT/vms"
+DEFAULT_USERNAME="user01"
+DEFAULT_MEMORY="2G"
+DEFAULT_CPUS="2"
+DEFAULT_DISK="10G"
+DEFAULT_IMAGE="debian13"
+
+# Global variables for interrupt handling
+CURRENT_VM_NAME=""
+CURRENT_VM_DIR=""
+INTERRUPT_CLEANUP=false
+
+get_image_url() {
+    local image_name="$1"
+    local arch="${2:-arm64}"
+    
+    case "$image_name" in
+        debian13)
+            if [[ "$arch" == "amd64" || "$arch" == "x86_64" ]]; then
+                echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+            else
+                echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+            fi
+            ;;
+        debian12)
+            if [[ "$arch" == "amd64" || "$arch" == "x86_64" ]]; then
+                echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+            else
+                echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2"
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+
+# Required binaries
+REQUIRED_BINS=(
+    "qemu-system-aarch64"
+    "qemu-system-x86_64"
+    "qemu-img"
+    "hdiutil"
+)
+
+# Flag to track if QEMU was just installed
+QEMU_JUST_INSTALLED=false
+
+# Flag to track if image was just downloaded
+IMAGE_JUST_DOWNLOADED=false
+
+usage() {
+    cat <<EOF
+Usage: $0 COMMAND [options]
+
+Commands:
+    create              Create and start a new VM
+    list                List all VMs and their status
+    start VM_NAME       Start an existing VM
+    stop VM_NAME        Stop a running VM
+    delete VM_NAME      Delete a VM and its files
+    ip VM_NAME          Find IP address of a bridge mode VM
+    ssh VM_NAME         SSH into a VM
+    purge               Delete all VMs (--force for no confirmation)
+    install             Install vm command to system PATH
+    uninstall           Remove vm command from system PATH
+    help                Show detailed help
+
+Create options:
+    --name NAME         VM name (optional - auto-generated if not provided)
+    --arch ARCH         Architecture (default: arm64, options: arm64, amd64)
+    --user USERNAME     Username (default: $DEFAULT_USERNAME)
+    --pass PASSWORD     Password (default: auto-generated)
+    --memory SIZE       Memory size (default: $DEFAULT_MEMORY)
+    --cpus COUNT        CPU count (default: $DEFAULT_CPUS)
+    --disk SIZE         Disk size (default: $DEFAULT_DISK)
+    --ssh-port PORT     SSH port (default: auto-assign)
+    --net-type TYPE     Network type (default: bridge, options: bridge, portfwd)
+    --show-console      Show console output
+    --debug             Show debug information including QEMU command
+
+Examples:
+    $0 create                           # Create VM with auto-generated name
+    $0 create --name myvm
+    $0 create --arch amd64 --memory 4G
+    $0 list
+    $0 start myvm
+    $0 ssh myvm
+    $0 purge --force
+    $0 install                          # Install to /usr/local/bin
+EOF
+}
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+GRAY='\033[0;90m'
+DARK_YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*"
+}
+
+error() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+# Progress indicator functions
+show_progress() {
+    local message="$1"
+    local vm_name="$2"
+    
+    # If QEMU was just installed or image was just downloaded, clear the current line first
+    if [[ "$QEMU_JUST_INSTALLED" == "true" || "$IMAGE_JUST_DOWNLOADED" == "true" ]]; then
+        echo -ne "\r\033[K" >&2  # Clear current line on stderr where the download indicator was
+    else
+        echo  # Start new line
+    fi
+    echo -ne "${DARK_YELLOW}⠋${NC} Creating VM \`${vm_name}\` in progress..."
+}
+
+show_success() {
+    local vm_name="$1"
+    local username="$2"
+    local password="$3"
+    local connection_info="$4"
+    
+    # Clear the progress line
+    echo -ne "\r\033[K"
+    echo -e "${GREEN}✔${NC} Your VM is ready and accessible via SSH with ${username}@${vm_name}.local using password: ${password}"
+    if [[ -n "$connection_info" ]]; then
+        echo "$connection_info"
+    fi
+}
+
+show_error() {
+    local reason="$1"
+    
+    # Clear the progress line
+    echo -ne "\r\033[K"
+    echo -e "${RED}✗${NC} VM creation failed: $reason"
+}
+
+update_progress() {
+    local vm_name="$1"
+    local step="$2"
+    
+    # Spinning dots animation using Braille patterns
+    local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    local frame_index=$((step % ${#frames[@]}))
+    echo -ne "\r${DARK_YELLOW}${frames[$frame_index]}${NC} Creating VM \`${vm_name}\` in progress..."
+}
+
+check_dependencies() {
+    local missing=()
+    for bin in "${REQUIRED_BINS[@]}"; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            missing+=("$bin")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        # Check if brew is available
+        if command -v brew >/dev/null 2>&1; then
+            # Show installation progress
+            echo -ne "${BLUE}[i]${NC} Installing qemu..."
+            if brew install qemu >/dev/null 2>&1; then
+                # Clear the installation message and set flag
+                echo -ne "\r\033[K"  # Clear line
+                QEMU_JUST_INSTALLED=true
+                
+                # Verify installation
+                local still_missing=()
+                for bin in "${REQUIRED_BINS[@]}"; do
+                    if ! command -v "$bin" >/dev/null 2>&1; then
+                        still_missing+=("$bin")
+                    fi
+                done
+                
+                if [[ ${#still_missing[@]} -gt 0 ]]; then
+                    error "Installation failed. Still missing: ${still_missing[*]}"
+                fi
+            else
+                echo -ne "\r\033[K"  # Clear line
+                error "Failed to install QEMU with brew. Please install manually: brew install qemu"
+            fi
+        else
+            error "Missing dependencies: ${missing[*]}. Install Homebrew first, then run: brew install qemu"
+        fi
+    fi
+}
+
+generate_password() {
+    local length=${1:-16}
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length"
+}
+
+generate_random_vm_name() {
+    # Generate a random VM name with format: adjective-noun-number (e.g., "independent-engine-345")
+    local adjectives=("swift" "bright" "clever" "happy" "quick" "bold" "calm" "deep" "fast" "great" 
+                      "kind" "light" "new" "old" "proud" "quiet" "rich" "safe" "tall" "warm"
+                      "wise" "young" "big" "small" "strong" "weak" "hot" "cold" "dry" "wet"
+                      "hard" "soft" "loud" "silent" "fresh" "stale" "clean" "dirty" "smooth" "rough"
+                      "sharp" "dull" "thick" "thin" "wide" "narrow" "long" "short" "high" "low"
+                      "independent" "reliable" "efficient" "modern" "classic" "stable" "dynamic" "secure")
+    
+    local nouns=("server" "engine" "cloud" "node" "host" "box" "core" "hub" "lab" "desk"
+                 "tower" "bridge" "gate" "port" "net" "web" "link" "zone" "base" "unit"
+                 "system" "device" "machine" "platform" "service" "cluster" "instance" "worker"
+                 "runner" "builder" "manager" "handler" "monitor" "tracker" "scanner" "parser"
+                 "router" "proxy" "cache" "store" "vault" "shield" "guard" "watch" "beacon" "signal")
+    
+    # Select random adjective and noun
+    local adj_count=${#adjectives[@]}
+    local noun_count=${#nouns[@]}
+    local adjective=${adjectives[$((RANDOM % adj_count))]}
+    local noun=${nouns[$((RANDOM % noun_count))]}
+    
+    # Generate random number between 100-999
+    local number=$((RANDOM % 900 + 100))
+    
+    echo "${adjective}-${noun}-${number}"
+}
+
+is_port_free() {
+    local port=$1
+    ! lsof -i ":$port" >/dev/null 2>&1 && 
+    ! nc -z 127.0.0.1 "$port" 2>/dev/null
+}
+
+find_free_port() {
+    local preferred=$1
+    
+    if [[ -n "$preferred" && "$preferred" -gt 0 ]] && is_port_free "$preferred"; then
+        echo "$preferred"
+        return
+    fi
+    
+    for port in $(seq 2222 9999); do
+        # Skip commonly used ports
+        case $port in 3000|3306|5000|5432|8000|8080|8443|9000) continue ;; esac
+        
+        if is_port_free "$port"; then
+            echo "$port"
+            return
+        fi
+    done
+    
+    error "No free port found"
+}
+
+download_image() {
+    local image_name="$1"
+    local arch="${2:-arm64}"
+    local url
+    url=$(get_image_url "$image_name" "$arch")
+    
+    if [[ -z "$url" ]]; then
+        error "Unknown image: $image_name"
+    fi
+    
+    local filename="${image_name}-${arch}.qcow2"
+    local dest="$IMAGES_DIR/$filename"
+    
+    if [[ -f "$dest" ]]; then
+        echo "$dest"
+        return
+    fi
+    
+    # Show download progress indicator (write to stderr to avoid command substitution capture)  
+    echo -ne "${BLUE}[i]${NC} Downloading $image_name for $arch architecture..." >&2
+    sync  # Ensure output is flushed
+    mkdir -p "$IMAGES_DIR"
+    
+    local temp_file="$dest.tmp"
+    if curl -L -s -f -o "$temp_file" "$url"; then
+        if [[ ! -s "$temp_file" ]]; then
+            rm -f "$temp_file"
+            error "Downloaded file is empty: $image_name"
+        fi
+        
+        if [[ "$url" == *.img ]]; then
+            qemu-img convert -O qcow2 "$temp_file" "$dest" && rm "$temp_file" || {
+                rm -f "$temp_file" "$dest"
+                error "Failed to convert image: $image_name"
+            }
+        else
+            mv "$temp_file" "$dest" || {
+                rm -f "$temp_file"
+                error "Failed to move image file: $image_name"
+            }
+        fi
+        
+        qemu-img info "$dest" >/dev/null 2>&1 || {
+            rm -f "$dest"
+            error "Downloaded image is not valid: $image_name"
+        }
+        
+        sync
+        # Clear the download message and set flag
+        echo -ne "\r\033[K" >&2  # Clear line
+        IMAGE_JUST_DOWNLOADED=true
+        echo "$dest"
+    else
+        echo -ne "\r\033[K" >&2  # Clear line
+        rm -f "$temp_file"
+        error "Failed to download image: $image_name"
+    fi
+}
+
+# Cleanup function for interrupted VM creation
+cleanup_vm_on_interrupt() {
+    if [[ "$INTERRUPT_CLEANUP" == "true" ]]; then
+        return  # Already cleaning up
+    fi
+    INTERRUPT_CLEANUP=true
+    
+    echo -ne "\r\033[K"  # Clear current line
+    echo -e "\033[0;31m✗\033[0m VM creation interrupted. Cleaning up..."
+    
+    if [[ -n "$CURRENT_VM_NAME" && -n "$CURRENT_VM_DIR" ]]; then
+        local pid_file="$CURRENT_VM_DIR/qemu.pid"
+        
+        # Stop QEMU process if running
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file" 2>/dev/null)
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                echo "Stopping QEMU process..."
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 2
+                # Force kill if still running
+                if kill -0 "$pid" 2>/dev/null; then
+                    kill -KILL "$pid" 2>/dev/null || true
+                fi
+            fi
+            rm -f "$pid_file"
+        fi
+        
+        # Remove partial VM directory
+        if [[ -d "$CURRENT_VM_DIR" ]]; then
+            echo "Removing partial VM directory..."
+            rm -rf "$CURRENT_VM_DIR"
+        fi
+        
+        echo "Cleanup completed."
+    fi
+    
+    exit 130  # Standard exit code for SIGINT
+}
+
+wait_for_cloud_init() {
+    local console_log="$1"
+    local timeout_seconds=${2:-300}
+    local vm_name="$3"
+    local count=0
+    local step=0
+    local timeout=$((timeout_seconds * 9))  # Adjust for 0.11s sleep intervals
+    
+    while [[ $count -lt $timeout ]]; do
+        if [[ -f "$console_log" ]]; then
+            if grep -q "CLOUD-INIT-READY" "$console_log" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        
+        # Update progress animation every 0.11 seconds (9x faster than original)
+        update_progress "$vm_name" $step
+        ((step++))
+        
+        sleep 0.11
+        ((count += 1))
+    done
+    
+    return 1
+}
+
+create_cloud_init() {
+    local vm_dir="$1"
+    local username="$2"
+    local password="$3"
+    local hostname="$4"
+    local net_type="$5"
+    
+    local user_data=$(cat <<EOF
+#cloud-config
+datasource_list: [ NoCloud, None ]
+final_message: "CLOUD-INIT-READY"
+package_update: false
+packages:
+  - openssh-server
+  - avahi-daemon
+output:
+  all: '| tee -a /var/log/cloud-init-output.log'
+$([[ "$net_type" == "bridge" ]] && cat <<NETEOF
+write_files:
+  - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/lib/systemd/systemd-networkd-wait-online --timeout=3
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    content: |
+      network: {config: disabled}
+  - path: /etc/netplan/01-netcfg.yaml
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          enp0s1:
+            dhcp4: yes
+            dhcp6: no
+            nameservers:
+              addresses: [8.8.8.8, 1.1.1.1]
+  - path: /usr/local/bin/report-ip.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # Wait for network to be ready
+      sleep 5
+      # Get IP address
+      IP=\$(ip -4 addr show enp0s1 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}')
+      if [ -n "\$IP" ]; then
+          echo "VM_IP_ADDRESS: \$IP"
+          logger "VM_IP_ADDRESS: \$IP"
+      fi
+NETEOF
+)
+users:
+  - name: $username
+    gecos: $username
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: '$password'
+ssh_pwauth: true
+chpasswd:
+  list: |
+    $username:$password
+  expire: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      PermitRootLogin prohibit-password
+      UseDNS no
+      GSSAPIAuthentication no
+runcmd:
+  - echo "$username:$password" | chpasswd
+  - passwd -u $username
+  - systemctl enable ssh
+  - systemctl enable avahi-daemon
+  - |
+    # Preserve SSH host keys across VM restarts
+    if [ ! -f /etc/ssh/.keys_generated ]; then
+      # Generate SSH host keys on first boot only
+      ssh-keygen -A
+      # Mark that keys have been generated to prevent regeneration
+      touch /etc/ssh/.keys_generated
+    fi
+$([[ "$net_type" == "bridge" ]] && cat <<BRIDGECMD
+  - mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d
+  - systemctl daemon-reload
+  - netplan apply
+BRIDGECMD
+)
+  - systemctl start ssh
+  - systemctl start avahi-daemon
+EOF
+)
+    
+    local meta_data="{\"instance-id\": \"$hostname\", \"local-hostname\": \"$hostname\"}"
+    local seed_iso="$vm_dir/seed.iso"
+    
+    # Create temporary directory for cloud-init files
+    local tmpdir=$(mktemp -d)
+    echo "$user_data" > "$tmpdir/user-data"
+    echo "$meta_data" > "$tmpdir/meta-data"
+    
+    # Save cloud-init config to VM directory for debugging
+    echo "$user_data" > "$vm_dir/cloud-init-user-data.yaml"
+    echo "$meta_data" > "$vm_dir/cloud-init-meta-data.json"
+    
+    # Create ISO using hdiutil
+    if hdiutil makehybrid -o "$seed_iso" -hfs -joliet -iso -default-volume-name "cidata" "$tmpdir" >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        echo "$seed_iso"
+        return
+    fi
+    
+    # Fallback to mkisofs/genisoimage
+    if command -v mkisofs >/dev/null 2>&1; then
+        mkisofs -V cidata -o "$seed_iso" -J -r "$tmpdir"
+    elif command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -V cidata -o "$seed_iso" -J -r "$tmpdir"
+    else
+        rm -rf "$tmpdir"
+        error "Failed to create cloud-init ISO. Install mkisofs or genisoimage"
+    fi
+    
+    rm -rf "$tmpdir"
+    echo "$seed_iso"
+}
+
+detect_firmware() {
+    local arch="${1:-arm64}"
+    
+    if [[ "$arch" == "amd64" ]]; then
+        # x86_64 doesn't need explicit BIOS path, uses default
+        return 0
+    fi
+    
+    # ARM64 firmware candidates
+    local candidates=(
+        "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+        "/usr/local/share/qemu/edk2-aarch64-code.fd"
+        "/usr/share/qemu/edk2-aarch64-code.fd"
+        "/usr/share/edk2/aarch64/QEMU_EFI.fd"
+        "/usr/share/AAVMF/AAVMF_CODE.fd"
+    )
+    
+    for firmware in "${candidates[@]}"; do
+        if [[ -f "$firmware" ]]; then
+            echo "$firmware"
+            return
+        fi
+    done
+    
+    error "AArch64 UEFI firmware not found. Install with: brew install qemu"
+}
+
+
+
+detect_bridge_vm_ip() {
+    local vm_name="$1" username="$2"
+    
+    # Try hostname lookup
+    if command -v nslookup >/dev/null 2>&1; then
+        local ip=$(nslookup "$vm_name.local" 2>/dev/null | awk '/^Address: [0-9]/ {print $2}' | head -1)
+        [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+    fi
+    
+    # Scan common bridge networks
+    local ranges=("192.168.105" "192.168.100" "192.168.1")
+    for range in "${ranges[@]}"; do
+        for i in {10..50}; do
+            local test_ip="$range.$i"
+            if nc -z -w1 "$test_ip" 22 2>/dev/null; then
+                echo "$test_ip"
+                return 0
+            fi
+        done
+    done
+    
+    return 1
+}
+
+generate_mac_address() {
+    local vm_name="$1"
+    # Generate a deterministic MAC address based on VM name to ensure consistency
+    # Use 52:54:00 prefix (QEMU's default) and generate last 3 octets from VM name hash
+    local hash=$(echo -n "$vm_name" | shasum -a 256 | cut -c1-6)
+    local mac="52:54:00"
+    for i in {1..3}; do
+        local byte="${hash:$((($i-1)*2)):2}"
+        mac="$mac:$byte"
+    done
+    echo "$mac"
+}
+
+build_qemu_args() {
+    local name="$1"
+    local arch="$2"
+    local memory="$3"
+    local cpus="$4"
+    local ssh_port="$5"
+    local vm_disk="$6"
+    local firmware="$7"
+    local net_type="$8"
+    
+    # Generate unique MAC address for this VM
+    local mac_addr=$(generate_mac_address "$name")
+    
+    if [[ "$arch" == "amd64" ]]; then
+        # x86_64 configuration
+        echo "qemu-system-x86_64"
+        echo "-machine" 
+        echo "q35"
+        echo "-cpu"
+        echo "qemu64"
+        echo "-m"
+        echo "$memory"
+        echo "-smp"
+        echo "$cpus"
+        echo "-object"
+        echo "memory-backend-ram,id=mem,size=$memory"
+        echo "-numa"
+        echo "node,memdev=mem"
+        echo "-name"
+        echo "$name"
+        echo "-device"
+        echo "virtio-net-pci,netdev=n0,mac=$mac_addr"
+        echo "-netdev"
+        if [[ "$net_type" == "bridge" ]]; then
+            echo "socket,id=n0,fd=3"
+        else
+            echo "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+        fi
+        echo "-device"
+        echo "virtio-rng-pci"
+        echo "-drive"
+        echo "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
+    else
+        # ARM64 configuration
+        echo "qemu-system-aarch64"
+        echo "-machine"
+        echo "virt"
+        echo "-cpu"
+        echo "max"
+        echo "-bios"
+        echo "$firmware"
+        echo "-m"
+        echo "$memory"
+        echo "-smp"
+        echo "$cpus"
+        echo "-name"
+        echo "$name"
+        echo "-device"
+        echo "virtio-net-pci,netdev=n0,mac=$mac_addr"
+        echo "-netdev"
+        if [[ "$net_type" == "bridge" ]]; then
+            echo "socket,id=n0,fd=3"
+        else
+            echo "user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+        fi
+        echo "-device"
+        echo "virtio-rng-pci"
+        echo "-drive"
+        echo "file=$vm_disk,if=virtio,cache=writeback,format=qcow2"
+    fi
+}
+
+
+# VM management functions
+vm_create() {
+    local name=""
+    local arch="arm64"
+    local username="$DEFAULT_USERNAME"
+    local password=""
+    local memory="$DEFAULT_MEMORY"
+    local cpus="$DEFAULT_CPUS"
+    local disk="$DEFAULT_DISK"
+    local ssh_port=""
+    local net_type="bridge"
+    local show_console=false
+    local debug=false
+    
+    # Set up interrupt handling
+    trap cleanup_vm_on_interrupt SIGINT
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name)
+                name="$2"
+                shift 2
+                ;;
+            --arch)
+                arch="$2"
+                shift 2
+                ;;
+            --user)
+                username="$2"
+                shift 2
+                ;;
+            --pass)
+                password="$2"
+                shift 2
+                ;;
+            --memory)
+                memory="$2"
+                shift 2
+                ;;
+            --cpus)
+                cpus="$2"
+                shift 2
+                ;;
+            --disk)
+                disk="$2"
+                shift 2
+                ;;
+            --ssh-port)
+                ssh_port="$2"
+                shift 2
+                ;;
+            --net-type)
+                net_type="$2"
+                if [[ "$net_type" != "bridge" && "$net_type" != "portfwd" ]]; then
+                    error "Invalid network type: $net_type. Valid options: bridge, portfwd"
+                fi
+                shift 2
+                ;;
+            --show-console)
+                show_console=true
+                shift
+                ;;
+            --debug)
+                debug=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    # Generate random name if not provided
+    if [[ -z "$name" ]]; then
+        name=$(generate_random_vm_name)
+        #log "Generated VM name: $name"
+    fi
+    
+    # Validate architecture
+    if [[ "$arch" != "arm64" && "$arch" != "amd64" && "$arch" != "x86_64" ]]; then
+        error "Invalid architecture: $arch. Options: arm64, amd64"
+    fi
+    
+    # Normalize architecture
+    [[ "$arch" == "x86_64" ]] && arch="amd64"
+    
+    [[ -z "$password" ]] && password=$(generate_password 16)
+    [[ -z "$ssh_port" ]] && ssh_port=$(find_free_port)
+    
+    local vm_dir="$VMS_DIR/$name"
+    
+    # Set global variables for cleanup
+    CURRENT_VM_NAME="$name"
+    CURRENT_VM_DIR="$vm_dir"
+    
+    # Check if VM already exists
+    if [[ -d "$vm_dir" ]]; then
+        local info_file="$vm_dir/info.json"
+        if [[ -f "$info_file" ]]; then
+            log "VM '$name' already exists. Checking if it's running..."
+            local pid_file="$vm_dir/qemu.pid"
+            if [[ -f "$pid_file" ]]; then
+                local pid=$(cat "$pid_file" 2>/dev/null)
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    local existing_port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+                    local existing_user=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                    local existing_pass=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                    error "VM '$name' is already running on port $existing_port (user: $existing_user, pass: $existing_pass)"
+                fi
+            fi
+            log "VM directory exists but VM is not running. Recreating..."
+        fi
+    fi
+    
+    mkdir -p "$vm_dir"
+    
+    
+    
+    # Download base image (suppress output)
+    local base_image
+    if ! base_image=$(download_image "$DEFAULT_IMAGE" "$arch"); then
+        show_error "Failed to download base image"
+        return 1
+    fi
+
+    # Show initial progress
+    show_progress "Creating VM" "$name"
+    
+    # Create VM disk (suppress output)
+    local vm_disk="$vm_dir/disk.qcow2"
+    if [[ ! -f "$vm_disk" ]]; then
+        if ! qemu-img convert -O qcow2 "$base_image" "$vm_disk" >/dev/null 2>&1; then
+            show_error "Failed to create VM disk from base image"
+            rm -f "$vm_disk"
+            return 1
+        fi
+        
+        if ! qemu-img resize "$vm_disk" "$disk" >/dev/null 2>&1; then
+            show_error "Failed to resize VM disk"
+            rm -f "$vm_disk"
+            return 1
+        fi
+        
+        sync
+        
+        if ! qemu-img info "$vm_disk" >/dev/null 2>&1; then
+            show_error "Failed to create valid VM disk"
+            rm -f "$vm_disk"
+            return 1
+        fi
+    fi
+    
+    # Create cloud-init seed (suppress output)
+    local seed_iso
+    if ! seed_iso=$(create_cloud_init "$vm_dir" "$username" "$password" "$name" "$net_type" 2>/dev/null); then
+        show_error "Failed to create cloud-init configuration"
+        return 1
+    fi
+    
+    # Detect firmware for ARM64
+    local firmware=""
+    if [[ "$arch" == "arm64" ]]; then
+        firmware=$(detect_firmware "$arch")
+    fi
+    
+    # Save VM info
+    local info_json="$vm_dir/info.json"
+    if [[ "$net_type" == "bridge" ]]; then
+        cat > "$info_json" <<EOF
+{
+  "name": "$name",
+  "arch": "$arch",
+  "image": "$DEFAULT_IMAGE",
+  "username": "$username",
+  "password": "$password",
+  "net_type": "$net_type",
+  "ssh": {
+    "host": "dhcp-assigned",
+    "port": 22
+  }
+}
+EOF
+    else
+        cat > "$info_json" <<EOF
+{
+  "name": "$name",
+  "arch": "$arch",
+  "image": "$DEFAULT_IMAGE",
+  "username": "$username",
+  "password": "$password",
+  "net_type": "$net_type",
+  "ssh": {
+    "host": "127.0.0.1",
+    "port": $ssh_port
+  }
+}
+EOF
+    fi
+    
+    # Build QEMU command based on architecture
+    local qemu_args=()
+    while IFS= read -r line; do
+        qemu_args+=("$line")
+    done < <(build_qemu_args "$name" "$arch" "$memory" "$cpus" "$ssh_port" "$vm_disk" "$firmware" "$net_type")
+    
+    # Add cloud-init for first boot only
+    local first_boot_marker="$vm_dir/.first_boot_complete"
+    qemu_args+=("-cdrom" "$seed_iso")
+    
+    # Add acceleration if available (only for ARM64 on macOS)
+    if [[ "$OSTYPE" == "darwin"* && "$arch" == "arm64" ]]; then
+        qemu_args+=("-accel" "hvf")
+    fi
+    
+    # Show debug information if requested
+    if [[ "$debug" == true ]]; then
+        echo "=== DEBUG INFO ==="
+        echo "VM Name: $name"
+        echo "Architecture: $arch"
+        echo "Memory: $memory"
+        echo "CPUs: $cpus"
+        echo "Network Type: $net_type"
+        echo "SSH Port: $ssh_port"
+        echo "VM Disk: $vm_disk"
+        echo "Seed ISO: $seed_iso"
+        [[ -n "$firmware" ]] && echo "Firmware: $firmware"
+        echo
+        echo "Cloud-Init Configuration:"
+        echo "------------------------"
+        if [[ -f "$vm_dir/cloud-init-user-data.yaml" ]]; then
+            echo "User Data:"
+            cat "$vm_dir/cloud-init-user-data.yaml"
+            echo
+            echo "Meta Data:"
+            cat "$vm_dir/cloud-init-meta-data.json"
+        else
+            echo "Cloud-init config files not found"
+        fi
+        echo "------------------------"
+        echo
+        echo "QEMU Command:"
+        printf "%s " "${qemu_args[@]}"
+        echo
+        echo "=================="
+        echo
+    fi
+    
+    # Add console/display options
+    if [[ "$show_console" == true ]]; then
+        qemu_args+=("-nographic" "-serial" "mon:stdio" "-monitor" "none")
+        echo "Starting VM with console (Ctrl+A then X to quit)"
+        echo "Credentials: $username / $password"
+        if [[ "$net_type" == "bridge" ]]; then
+            echo "Network: Bridged mode (VM will get DHCP IP)"
+        else
+            echo "SSH command: ssh $username@127.0.0.1 -p $ssh_port"
+        fi
+        read -p "Press Enter to start..."
+        if [[ "$net_type" == "bridge" ]]; then
+            exec /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet_client /opt/homebrew/var/run/socket_vmnet "${qemu_args[@]}"
+        else
+            exec "${qemu_args[@]}"
+        fi
+    else
+        local console_log="$vm_dir/console.log"
+        local pid_file="$vm_dir/qemu.pid"
+        qemu_args+=(
+            "-daemonize"
+            "-display" "none"
+            "-serial" "file:$console_log"
+            "-monitor" "none"
+            "-pidfile" "$pid_file"
+        )
+        
+        # Try to start QEMU, with retry logic for port conflicts
+        local max_retries=5
+        local retry_count=0
+        
+        while [[ $retry_count -lt $max_retries ]]; do
+            local qemu_success=false
+            
+            if [[ "$net_type" == "bridge" ]]; then
+                if /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet_client /opt/homebrew/var/run/socket_vmnet "${qemu_args[@]}" >/dev/null 2>&1; then
+                    qemu_success=true
+                    break
+                fi
+            else
+                if "${qemu_args[@]}" >/dev/null 2>&1; then
+                    qemu_success=true
+                    break
+                else
+                    # Try with different port for portfwd mode
+                    retry_count=$((retry_count + 1))
+                    if [[ $retry_count -lt $max_retries ]]; then
+                        ssh_port=$(find_free_port)
+                        
+                        # Update the QEMU args with new port
+                        for i in "${!qemu_args[@]}"; do
+                            if [[ "${qemu_args[i]}" =~ ^user,id=n0,hostfwd=tcp:127\.0\.0\.1:[0-9]+-:22$ ]]; then
+                                qemu_args[i]="user,id=n0,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+                                break
+                            fi
+                        done
+                        
+                        # Update the info JSON
+                        cat > "$info_json" <<EOF >/dev/null 2>&1
+{
+  "name": "$name",
+  "arch": "$arch",
+  "image": "$DEFAULT_IMAGE",
+  "username": "$username",
+  "password": "$password",
+  "net_type": "$net_type",
+  "ssh": {
+    "host": "127.0.0.1",
+    "port": $ssh_port
+  }
+}
+EOF
+                        sleep 1
+                        continue
+                    fi
+                fi
+            fi
+            
+            if [[ "$qemu_success" == false ]]; then
+                retry_count=$((retry_count + 1))
+                if [[ $retry_count -ge $max_retries ]]; then
+                    show_error "Failed to start QEMU after $max_retries attempts"
+                    return 1
+                fi
+                sleep 1
+            fi
+        done
+        
+        # Wait for cloud-init completion with progress animation
+        if wait_for_cloud_init "$console_log" 300 "$name"; then
+            touch "$first_boot_marker"
+            # Clear interrupt handling once successful
+            trap - SIGINT
+            CURRENT_VM_NAME=""
+            CURRENT_VM_DIR=""
+            if [[ "$net_type" == "bridge" ]]; then
+                show_success "$name" "$username" "$password" ""
+            else
+                show_success "$name" "$username" "$password" "(Alternative: ssh $username@127.0.0.1 -p $ssh_port)"
+            fi
+        else
+            show_error "Cloud-init did not complete within 5 minutes"
+            # Clean up on timeout
+            cleanup_vm_on_interrupt
+            return 1
+        fi
+    fi
+    
+    # Clear interrupt handling on normal completion
+    trap - SIGINT
+    CURRENT_VM_NAME=""
+    CURRENT_VM_DIR=""
+}
+
+vm_list() {
+    if [[ ! -d "$VMS_DIR" ]]; then
+        log "No VMs found (VMs directory doesn't exist)"
+        return
+    fi
+    
+    local vm_count=0
+    echo
+    printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "NAME" "STATUS" "ARCH" "IMAGE" "HOSTNAME" "CREDENTIALS"
+    printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "----" "------" "----" "-----" "--------" "-----------"
+    
+    for vm_dir in "$VMS_DIR"/*; do
+        if [[ ! -d "$vm_dir" ]]; then
+            continue
+        fi
+        
+        local vm_name=$(basename "$vm_dir")
+        local info_file="$vm_dir/info.json"
+        local pid_file="$vm_dir/qemu.pid"
+        
+        if [[ ! -f "$info_file" ]]; then
+            printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "$vm_name" "BROKEN" "-" "-" "-" "-"
+            ((vm_count++))
+            continue
+        fi
+        
+        local status="STOPPED"
+        local ssh_info="-"
+        local credentials="-"
+        
+        # Check if VM is running
+        local is_running=false
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file" 2>/dev/null)
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                is_running=true
+            else
+                # Clean up stale PID file
+                rm -f "$pid_file"
+            fi
+        fi
+        
+        # Fallback check: look for running QEMU process with this VM name
+        # This handles cases where VMs were started with --show-console (no PID file)
+        if [[ "$is_running" == "false" ]]; then
+            if pgrep -f "qemu.*-name $vm_name" >/dev/null 2>&1; then
+                is_running=true
+            fi
+        fi
+        
+        if [[ "$is_running" == "true" ]]; then
+            status="RUNNING"
+            
+            # Extract info from JSON
+            local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+            local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+            local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+            local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
+            
+            # Default to portfwd if net_type is not found (for backward compatibility with existing VMs)
+            [[ -z "$net_type" ]] && net_type="portfwd"
+            
+            if [[ "$net_type" == "bridge" ]]; then
+                # For bridge mode, show hostname format
+                ssh_info="$vm_name.local"
+            else
+                ssh_info="127.0.0.1:$port"
+            fi
+            credentials="$username / $password"
+        fi
+        
+        # Get info from JSON file
+        local arch=$(grep -o '"arch": "[^"]*"' "$info_file" | cut -d'"' -f4)
+        local image=$(grep -o '"image": "[^"]*"' "$info_file" | cut -d'"' -f4)
+        
+        printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "$vm_name" "$status" "${arch:-arm64}" "${image:-unknown}" "$ssh_info" "$credentials"
+        ((vm_count++))
+    done
+    
+    if [[ $vm_count -eq 0 ]]; then
+        echo "No VMs found"
+    else
+        echo
+        echo "Total VMs: $vm_count"
+    fi
+}
+
+vm_start() {
+    local name="$1"
+    local show_console=false
+    local debug=false
+    
+    [[ -z "$name" ]] && error "VM name is required"
+    
+    # Parse remaining arguments
+    shift
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --show-console)
+                show_console=true
+                shift
+                ;;
+            --debug)
+                debug=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    local vm_dir="$VMS_DIR/$name"
+    local info_file="$vm_dir/info.json"
+    local pid_file="$vm_dir/qemu.pid"
+    
+    # Check if VM exists
+    if [[ ! -d "$vm_dir" ]] || [[ ! -f "$info_file" ]]; then
+        error "VM '$name' does not exist"
+    fi
+    
+    # Check if already running
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+            local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+            local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+            error "VM '$name' is already running on port $port (user: $username, pass: $password)"
+        fi
+        # Clean up stale PID file
+        rm -f "$pid_file"
+    fi
+    
+    log "Starting VM: $name"
+    
+    # Extract VM info
+    local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    local ssh_port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+    local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    
+    # Default to portfwd if net_type is not found (for backward compatibility with existing VMs)
+    [[ -z "$net_type" ]] && net_type="portfwd"
+    
+    # Find a free port if the saved one is in use
+    port_check_function() {
+        local test_port=$1
+        
+        # First check with lsof
+        if command -v lsof >/dev/null 2>&1; then
+            if lsof -i ":$test_port" >/dev/null 2>&1; then
+                return 1
+            fi
+        fi
+        
+        # Also check with netstat
+        if command -v netstat >/dev/null 2>&1; then
+            if netstat -an 2>/dev/null | grep -q "\\.$test_port " || netstat -an 2>/dev/null | grep -q ":$test_port "; then
+                return 1
+            fi
+        fi
+        
+        return 0
+    }
+    
+    if ! port_check_function "$ssh_port"; then
+        log "Saved SSH port $ssh_port is in use, finding new port..."
+        ssh_port=$(find_free_port)
+        log "Using new SSH port: $ssh_port"
+        
+        # Update info.json with new port
+        local temp_json=$(mktemp)
+        sed "s/\"port\": [0-9]*/\"port\": $ssh_port/" "$info_file" > "$temp_json"
+        mv "$temp_json" "$info_file"
+    fi
+    
+    # Get VM files
+    local vm_disk="$vm_dir/disk.qcow2"
+    local seed_iso="$vm_dir/seed.iso"
+    
+    if [[ ! -f "$vm_disk" ]]; then
+        error "VM disk not found: $vm_disk"
+    fi
+    
+    # Get architecture from VM info
+    local arch=$(grep -o '"arch": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    [[ -z "$arch" ]] && arch="arm64"  # Default to arm64 for backward compatibility
+    
+    # Detect firmware for ARM64
+    local firmware=""
+    if [[ "$arch" == "arm64" ]]; then
+        firmware=$(detect_firmware "$arch")
+    fi
+    
+    # Build QEMU command based on architecture
+    local qemu_args=()
+    local memory="$DEFAULT_MEMORY"
+    local cpus="$DEFAULT_CPUS"
+    while IFS= read -r line; do
+        qemu_args+=("$line")
+    done < <(build_qemu_args "$name" "$arch" "$memory" "$cpus" "$ssh_port" "$vm_disk" "$firmware" "$net_type")
+    
+    # Only add cloud-init for fresh VMs (check if this is first boot)
+    # We determine this by checking if the VM has been booted before
+    local first_boot_marker="$vm_dir/.first_boot_complete"
+    if [[ -f "$seed_iso" ]] && [[ ! -f "$first_boot_marker" ]]; then
+        qemu_args+=("-cdrom" "$seed_iso")
+    fi
+    
+    # Add acceleration if available (only for ARM64 on macOS)
+    if [[ "$OSTYPE" == "darwin"* && "$arch" == "arm64" ]]; then
+        qemu_args+=("-accel" "hvf")
+    fi
+    
+    # Show debug information if requested
+    if [[ "$debug" == true ]]; then
+        echo "=== DEBUG INFO (VM START) ==="
+        echo "VM Name: $name"
+        echo "Architecture: $arch"
+        echo "Network Type: $net_type"
+        echo "SSH Port: $ssh_port"
+        echo "VM Disk: $vm_disk"
+        [[ -f "$seed_iso" && ! -f "$first_boot_marker" ]] && echo "Seed ISO: $seed_iso (first boot)"
+        [[ -n "$firmware" ]] && echo "Firmware: $firmware"
+        echo
+        echo "QEMU Command:"
+        printf "%s " "${qemu_args[@]}"
+        echo
+        echo "============================="
+        echo
+    fi
+    
+    # Add console/display options
+    if [[ "$show_console" == true ]]; then
+        qemu_args+=("-nographic" "-serial" "mon:stdio" "-monitor" "none")
+        echo "Starting VM with console (Ctrl+A then X to quit)"
+        echo "Credentials: $username / $password"
+        if [[ "$net_type" == "bridge" ]]; then
+            echo "Network: Bridged mode (VM will get DHCP IP)"
+        else
+            echo "SSH command: ssh $username@127.0.0.1 -p $ssh_port"
+        fi
+        read -p "Press Enter to start..."
+        if [[ "$net_type" == "bridge" ]]; then
+            exec /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet_client /opt/homebrew/var/run/socket_vmnet "${qemu_args[@]}"
+        else
+            exec "${qemu_args[@]}"
+        fi
+    else
+        local console_log="$vm_dir/console.log"
+        qemu_args+=(
+            "-daemonize"
+            "-display" "none"
+            "-serial" "file:$console_log"
+            "-monitor" "none"
+            "-pidfile" "$pid_file"
+        )
+        
+        if [[ "$net_type" == "bridge" ]]; then
+            bridge_success=0
+            if /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet_client /opt/homebrew/var/run/socket_vmnet "${qemu_args[@]}" 2>/dev/null; then
+                bridge_success=0
+            else
+                bridge_success=1
+            fi
+        else
+            bridge_success=0
+            if "${qemu_args[@]}" 2>/dev/null; then
+                bridge_success=0
+            else
+                bridge_success=1
+            fi
+        fi
+        if [[ $bridge_success -eq 0 ]]; then
+            # Wait for cloud-init completion if first boot
+            if [[ ! -f "$first_boot_marker" ]]; then
+                show_progress "Starting VM" "$name"
+                if wait_for_cloud_init "$console_log" 300 "$name"; then
+                    touch "$first_boot_marker"
+                    if [[ "$net_type" == "bridge" ]]; then
+                        show_success "$name" "$username" "$password" ""
+                    else
+                        show_success "$name" "$username" "$password" "(Alternative: ssh $username@127.0.0.1 -p $ssh_port)"
+                    fi
+                else
+                    show_error "Cloud-init did not complete within 5 minutes"
+                    return 1
+                fi
+            else
+                # VM already initialized, just show ready message
+                if [[ "$net_type" == "bridge" ]]; then
+                    echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
+                else
+                    echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
+                    echo "(Alternative: ssh $username@127.0.0.1 -p $ssh_port)"
+                fi
+            fi
+        else
+            show_error "Failed to start QEMU"
+            return 1
+        fi
+    fi
+}
+
+vm_stop() {
+    local name="$1"
+    
+    [[ -z "$name" ]] && error "VM name is required"
+    
+    local vm_dir="$VMS_DIR/$name"
+    local pid_file="$vm_dir/qemu.pid"
+    
+    # Check if VM exists
+    if [[ ! -d "$vm_dir" ]]; then
+        error "VM '$name' does not exist"
+    fi
+    
+    # Check if VM is running - first check PID file, then fallback to process search
+    local pid=""
+    if [[ -f "$pid_file" ]]; then
+        pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            log "VM '$name' is not running (cleaning up stale PID file)"
+            rm -f "$pid_file"
+            pid=""
+        fi
+    fi
+    
+    # Fallback: look for running QEMU process if no valid PID found
+    if [[ -z "$pid" ]]; then
+        pid=$(pgrep -f "qemu.*-name $name" | head -1)
+        if [[ -z "$pid" ]]; then
+            log "VM '$name' is not running"
+            return
+        fi
+    fi
+    
+    log "Stopping VM: $name (PID: $pid)"
+    
+    # Try graceful shutdown first
+    if kill -TERM "$pid" 2>/dev/null; then
+        local count=0
+        local timeout=30
+        
+        log "Sending graceful shutdown signal..."
+        while [[ $count -lt $timeout ]] && kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+            ((count++))
+        done
+        
+        if kill -0 "$pid" 2>/dev/null; then
+            log "Graceful shutdown timed out, forcing stop..."
+            kill -KILL "$pid" 2>/dev/null
+            sleep 2
+        fi
+        
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log "VM stopped successfully"
+            rm -f "$pid_file"
+        else
+            error "Failed to stop VM"
+        fi
+    else
+        error "Failed to send stop signal to VM"
+    fi
+}
+
+vm_ip() {
+    local name="$1"
+    [[ -z "$name" ]] && error "VM name is required"
+    
+    local vm_dir="$VMS_DIR/$name"
+    local info_file="$vm_dir/info.json"
+    
+    [[ ! -d "$vm_dir" || ! -f "$info_file" ]] && error "VM '$name' does not exist"
+    
+    local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    [[ -z "$net_type" ]] && net_type="portfwd"
+    
+    if [[ "$net_type" != "bridge" ]]; then
+        local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+        echo "VM '$name' uses port forwarding: ssh user@127.0.0.1 -p $port"
+        return
+    fi
+    
+    local pid_file="$vm_dir/qemu.pid"
+    if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+        echo "VM '$name' is not running"
+        return
+    fi
+    
+    local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    echo "Searching for IP address of bridge VM '$name'..."
+    
+    local detected_ip
+    if detected_ip=$(detect_bridge_vm_ip "$name" "$username"); then
+        echo "Found IP: $detected_ip"
+        echo "Connect with: ssh $username@$detected_ip"
+        local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+        echo "Password: $password"
+    else
+        echo "Could not detect IP address. Check console log: cat $vm_dir/console.log"
+    fi
+}
+
+vm_ssh() {
+    local name="$1"
+    [[ -z "$name" ]] && error "VM name is required"
+    
+    local vm_dir="$VMS_DIR/$name"
+    local info_file="$vm_dir/info.json"
+    
+    [[ ! -d "$vm_dir" || ! -f "$info_file" ]] && error "VM '$name' does not exist"
+    
+    local pid_file="$vm_dir/qemu.pid"
+    if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+        error "VM '$name' is not running"
+    fi
+    
+    local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    [[ -z "$net_type" ]] && net_type="portfwd"
+    
+    if [[ "$net_type" == "bridge" ]]; then
+        local detected_ip
+        if detected_ip=$(detect_bridge_vm_ip "$name" "$username"); then
+            exec ssh "$username@$detected_ip"
+        else
+            error "Could not detect VM IP address. Use './linux vm ip $name' first"
+        fi
+    else
+        local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+        exec ssh "$username@127.0.0.1" -p "$port"
+    fi
+}
+
+vm_delete() {
+    local name="$1"
+    local force=false
+    
+    [[ -z "$name" ]] && error "VM name is required"
+    
+    # Parse remaining arguments
+    shift
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --force)
+                force=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    local vm_dir="$VMS_DIR/$name"
+    
+    # Check if VM exists
+    if [[ ! -d "$vm_dir" ]]; then
+        error "VM '$name' does not exist"
+    fi
+    
+    # Check if VM is running and stop it
+    local pid_file="$vm_dir/qemu.pid"
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log "Stopping running VM before deletion..."
+            vm_stop "$name"
+        fi
+    fi
+    
+    # Confirm deletion
+    if [[ "$force" == false ]]; then
+        echo "This will permanently delete VM '$name' and all its data."
+        read -p "Are you sure? (y/N): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            log "Deletion cancelled"
+            return
+        fi
+    fi
+    
+    log "Deleting VM: $name"
+    rm -rf "$vm_dir"
+    log "VM '$name' deleted successfully"
+}
+
+purge() {
+    local force=false
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --force) force=true; shift ;;
+            --help|-h) 
+                echo "Usage: $0 purge [--force]"
+                echo "  --force    Delete all VMs without confirmation"
+                echo "  --help     Show this help"
+                return 0
+                ;;
+            *) error "Unknown option: $1" ;;
+        esac
+    done
+    
+    local vm_count=0
+    if [[ -d "$VMS_DIR" ]]; then
+        for vm_dir in "$VMS_DIR"/*; do
+            [[ -d "$vm_dir" ]] && ((vm_count++))
+        done
+    fi
+    
+    [[ $vm_count -eq 0 ]] && { log "No VMs found"; return; }
+    
+    log "Will delete $vm_count VM(s)"
+    
+    if [[ "$force" == false ]]; then
+        echo "WARNING: This will permanently delete ALL VMs!"
+        read -p "Are you sure? (y/N): " confirm
+        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { log "Cancelled"; return; }
+    fi
+    
+    log "Deleting VMs..."
+    for vm_dir in "$VMS_DIR"/*; do
+        [[ ! -d "$vm_dir" ]] && continue
+        
+        local vm_name=$(basename "$vm_dir")
+        local pid_file="$vm_dir/qemu.pid"
+        
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file" 2>/dev/null)
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null
+                sleep 2
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+        
+        rm -rf "$vm_dir"
+    done
+    
+    [[ -d "$VMS_DIR" ]] && rmdir "$VMS_DIR" 2>/dev/null
+    [[ -d "$WORK_ROOT" ]] && rmdir "$WORK_ROOT" 2>/dev/null
+    
+    log "Deleted $vm_count VM(s)"
+}
+
+install_command() {
+    local install_path="${1:-/usr/local/bin}"
+    local script_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+    local target_path="$install_path/vm"
+    
+    # Check if script exists
+    if [[ ! -f "$script_path" ]]; then
+        error "Cannot find script at: $script_path"
+    fi
+    
+    # Check if target directory exists and is writable
+    if [[ ! -d "$install_path" ]]; then
+        error "Directory $install_path does not exist"
+    fi
+    
+    # Confirm installation path with user
+    echo "This will install the vm command to: $target_path"
+    if [[ -f "$target_path" ]]; then
+        echo "Warning: File already exists and will be overwritten"
+    fi
+    read -p "Continue? (y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log "Installation cancelled"
+        return
+    fi
+    
+    # Copy script to target location
+    if cp "$script_path" "$target_path" && chmod +x "$target_path"; then
+        log "Successfully installed vm command to: $target_path"
+        echo
+        echo "You can now run: vm --help"
+        echo "Make sure $install_path is in your PATH"
+    else
+        error "Failed to install. You may need to run with sudo: sudo $0 install"
+    fi
+}
+
+uninstall_command() {
+    # Find the vm command in PATH
+    local vm_path
+    if vm_path=$(which vm 2>/dev/null); then
+        echo "Found vm command at: $vm_path"
+        read -p "Remove this file? (y/N): " confirm
+        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            if rm "$vm_path"; then
+                log "Successfully removed vm command from: $vm_path"
+            else
+                error "Failed to remove file. You may need sudo permissions"
+            fi
+        else
+            log "Uninstall cancelled"
+        fi
+    else
+        log "vm command not found in PATH - nothing to uninstall"
+    fi
+}
+
+vm_help() {
+    cat <<EOF
+VM Manager - Create and manage Linux VMs on macOS
+
+USAGE: $0 COMMAND [options]
+
+COMMANDS:
+    create              Create and start a new VM
+    list                List all VMs and their status
+    start VM_NAME       Start an existing VM
+    stop VM_NAME        Stop a running VM  
+    delete VM_NAME      Delete a VM and its files
+    ip VM_NAME          Find IP address of a bridge mode VM
+    ssh VM_NAME         SSH into a VM
+    purge               Delete all VMs (--force for no confirmation)
+    install             Install to system PATH (/usr/local/bin)
+    uninstall           Remove from system PATH
+    help                Show this help
+
+CREATE OPTIONS:
+    --name NAME         VM name (optional - auto-generated if not provided)
+    --arch ARCH         Architecture: arm64, amd64 (default: arm64)
+    --user USERNAME     Username (default: $DEFAULT_USERNAME)
+    --pass PASSWORD     Password (default: auto-generated)
+    --memory SIZE       Memory size (default: $DEFAULT_MEMORY)
+    --cpus COUNT        CPU count (default: $DEFAULT_CPUS)
+    --disk SIZE         Disk size (default: $DEFAULT_DISK)
+    --ssh-port PORT     SSH port (default: auto-assign)
+    --net-type TYPE     Network type (default: bridge, options: bridge, portfwd)
+    --show-console      Show console output
+    --debug             Show debug information
+
+EXAMPLES:
+    $0 create                           # Create VM with random name
+    $0 create --name myvm
+    $0 create --arch amd64 --memory 4G
+    $0 list
+    $0 start myvm
+    $0 ssh myvm
+    $0 install                          # Install to /usr/local/bin
+EOF
+}
+
+
+main() {
+    local command="${1:-}"
+    
+    case "$command" in
+        create)
+            shift
+            check_dependencies
+            mkdir -p "$IMAGES_DIR" "$VMS_DIR"
+            vm_create "$@"
+            ;;
+        list) mkdir -p "$VMS_DIR"; vm_list ;;
+        start) shift; check_dependencies; vm_start "$@" ;;
+        stop) shift; vm_stop "$@" ;;
+        delete) shift; vm_delete "$@" ;;
+        ip) shift; vm_ip "$@" ;;
+        ssh) shift; vm_ssh "$@" ;;
+        purge) shift; purge "$@" ;;
+        install) shift; install_command "$@" ;;
+        uninstall) shift; uninstall_command "$@" ;;
+        help|--help|-h|"") vm_help ;;
+        *) error "Unknown command: $command. Use '$0 help' for usage information." ;;
+    esac
+}
+
+main "$@"

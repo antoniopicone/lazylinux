@@ -11,3 +11,6 @@ dist/
 .DS_Store
 .vm/
 .images/
+node_modules
+package-lock.json
+/vscode-plugin/out
