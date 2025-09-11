@@ -3,14 +3,14 @@
 set -e
 
 # Configuration
-WORK_ROOT="$HOME/.linux"
+WORK_ROOT="$HOME/.vm"
 IMAGES_DIR="$WORK_ROOT/images"
 VMS_DIR="$WORK_ROOT/vms"
 DEFAULT_USERNAME="user01"
 DEFAULT_MEMORY="2G"
 DEFAULT_CPUS="2"
 DEFAULT_DISK="10G"
-DEFAULT_IMAGE="debian12"
+DEFAULT_IMAGE="debian13"
 
 # Global variables for interrupt handling
 CURRENT_VM_NAME=""
@@ -22,6 +22,13 @@ get_image_url() {
     local arch="${2:-arm64}"
     
     case "$image_name" in
+        debian13)
+            if [[ "$arch" == "amd64" || "$arch" == "x86_64" ]]; then
+                echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+            else
+                echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+            fi
+            ;;
         debian12)
             if [[ "$arch" == "amd64" || "$arch" == "x86_64" ]]; then
                 echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
@@ -44,11 +51,17 @@ REQUIRED_BINS=(
     "hdiutil"
 )
 
+# Flag to track if QEMU was just installed
+QEMU_JUST_INSTALLED=false
+
+# Flag to track if image was just downloaded
+IMAGE_JUST_DOWNLOADED=false
+
 usage() {
     cat <<EOF
-Usage: $0 vm COMMAND [options]
+Usage: $0 COMMAND [options]
 
-VM Commands:
+Commands:
     create              Create and start a new VM
     list                List all VMs and their status
     start VM_NAME       Start an existing VM
@@ -56,14 +69,13 @@ VM Commands:
     delete VM_NAME      Delete a VM and its files
     ip VM_NAME          Find IP address of a bridge mode VM
     ssh VM_NAME         SSH into a VM
-    help                Show detailed VM help
+    purge               Delete all VMs (--force for no confirmation)
+    install             Install vm command to system PATH
+    uninstall           Remove vm command from system PATH
+    help                Show detailed help
 
-System Commands:
-    purge               Delete all VMs
-                        --force         Purge without confirmation
-
-VM Create options:
-    --name NAME         VM name (required)
+Create options:
+    --name NAME         VM name (optional - auto-generated if not provided)
     --arch ARCH         Architecture (default: arm64, options: arm64, amd64)
     --user USERNAME     Username (default: $DEFAULT_USERNAME)
     --pass PASSWORD     Password (default: auto-generated)
@@ -76,12 +88,14 @@ VM Create options:
     --debug             Show debug information including QEMU command
 
 Examples:
-    $0 vm create --name myvm
-    $0 vm create --name myvm --arch amd64 --memory 4G
-    $0 vm list
-    $0 vm start myvm
-    $0 vm ssh myvm
+    $0 create                           # Create VM with auto-generated name
+    $0 create --name myvm
+    $0 create --arch amd64 --memory 4G
+    $0 list
+    $0 start myvm
+    $0 ssh myvm
     $0 purge --force
+    $0 install                          # Install to /usr/local/bin
 EOF
 }
 
@@ -106,6 +120,13 @@ error() {
 show_progress() {
     local message="$1"
     local vm_name="$2"
+    
+    # If QEMU was just installed or image was just downloaded, clear the current line first
+    if [[ "$QEMU_JUST_INSTALLED" == "true" || "$IMAGE_JUST_DOWNLOADED" == "true" ]]; then
+        echo -ne "\r\033[K" >&2  # Clear current line on stderr where the download indicator was
+    else
+        echo  # Start new line
+    fi
     echo -ne "${DARK_YELLOW}⠋${NC} Creating VM \`${vm_name}\` in progress..."
 }
 
@@ -152,7 +173,13 @@ check_dependencies() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         # Check if brew is available
         if command -v brew >/dev/null 2>&1; then
+            # Show installation progress
+            echo -ne "${BLUE}[i]${NC} Installing qemu..."
             if brew install qemu >/dev/null 2>&1; then
+                # Clear the installation message and set flag
+                echo -ne "\r\033[K"  # Clear line
+                QEMU_JUST_INSTALLED=true
+                
                 # Verify installation
                 local still_missing=()
                 for bin in "${REQUIRED_BINS[@]}"; do
@@ -165,6 +192,7 @@ check_dependencies() {
                     error "Installation failed. Still missing: ${still_missing[*]}"
                 fi
             else
+                echo -ne "\r\033[K"  # Clear line
                 error "Failed to install QEMU with brew. Please install manually: brew install qemu"
             fi
         else
@@ -176,6 +204,33 @@ check_dependencies() {
 generate_password() {
     local length=${1:-16}
     LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length"
+}
+
+generate_random_vm_name() {
+    # Generate a random VM name with format: adjective-noun-number (e.g., "independent-engine-345")
+    local adjectives=("swift" "bright" "clever" "happy" "quick" "bold" "calm" "deep" "fast" "great" 
+                      "kind" "light" "new" "old" "proud" "quiet" "rich" "safe" "tall" "warm"
+                      "wise" "young" "big" "small" "strong" "weak" "hot" "cold" "dry" "wet"
+                      "hard" "soft" "loud" "silent" "fresh" "stale" "clean" "dirty" "smooth" "rough"
+                      "sharp" "dull" "thick" "thin" "wide" "narrow" "long" "short" "high" "low"
+                      "independent" "reliable" "efficient" "modern" "classic" "stable" "dynamic" "secure")
+    
+    local nouns=("server" "engine" "cloud" "node" "host" "box" "core" "hub" "lab" "desk"
+                 "tower" "bridge" "gate" "port" "net" "web" "link" "zone" "base" "unit"
+                 "system" "device" "machine" "platform" "service" "cluster" "instance" "worker"
+                 "runner" "builder" "manager" "handler" "monitor" "tracker" "scanner" "parser"
+                 "router" "proxy" "cache" "store" "vault" "shield" "guard" "watch" "beacon" "signal")
+    
+    # Select random adjective and noun
+    local adj_count=${#adjectives[@]}
+    local noun_count=${#nouns[@]}
+    local adjective=${adjectives[$((RANDOM % adj_count))]}
+    local noun=${nouns[$((RANDOM % noun_count))]}
+    
+    # Generate random number between 100-999
+    local number=$((RANDOM % 900 + 100))
+    
+    echo "${adjective}-${noun}-${number}"
 }
 
 is_port_free() {
@@ -223,7 +278,9 @@ download_image() {
         return
     fi
     
-    [[ "${3:-}" == "verbose" ]] && log "Downloading $image_name image..." >&2
+    # Show download progress indicator (write to stderr to avoid command substitution capture)  
+    echo -ne "${BLUE}[i]${NC} Downloading $image_name for $arch architecture..." >&2
+    sync  # Ensure output is flushed
     mkdir -p "$IMAGES_DIR"
     
     local temp_file="$dest.tmp"
@@ -251,8 +308,12 @@ download_image() {
         }
         
         sync
+        # Clear the download message and set flag
+        echo -ne "\r\033[K" >&2  # Clear line
+        IMAGE_JUST_DOWNLOADED=true
         echo "$dest"
     else
+        echo -ne "\r\033[K" >&2  # Clear line
         rm -f "$temp_file"
         error "Failed to download image: $image_name"
     fi
@@ -416,11 +477,6 @@ $([[ "$net_type" == "bridge" ]] && cat <<BRIDGECMD
   - mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d
   - systemctl daemon-reload
   - netplan apply
-  - |
-    # Report IP address after network is ready
-    (sleep 10 && /usr/local/bin/report-ip.sh) &
-    # Also output IP to console
-    (sleep 15 && echo "=== VM NETWORK CONFIGURATION ===" && ip -4 addr show enp0s1 && echo "=== END NETWORK CONFIGURATION ===") &
 BRIDGECMD
 )
   - systemctl start ssh
@@ -673,7 +729,11 @@ vm_create() {
         esac
     done
     
-    [[ -z "$name" ]] && error "--name is required"
+    # Generate random name if not provided
+    if [[ -z "$name" ]]; then
+        name=$(generate_random_vm_name)
+        #log "Generated VM name: $name"
+    fi
     
     # Validate architecture
     if [[ "$arch" != "arm64" && "$arch" != "amd64" && "$arch" != "x86_64" ]]; then
@@ -713,15 +773,17 @@ vm_create() {
     
     mkdir -p "$vm_dir"
     
-    # Show initial progress
-    show_progress "Creating VM" "$name"
+    
     
     # Download base image (suppress output)
     local base_image
-    if ! base_image=$(download_image "$DEFAULT_IMAGE" "$arch" 2>/dev/null); then
+    if ! base_image=$(download_image "$DEFAULT_IMAGE" "$arch"); then
         show_error "Failed to download base image"
         return 1
     fi
+
+    # Show initial progress
+    show_progress "Creating VM" "$name"
     
     # Create VM disk (suppress output)
     local vm_disk="$vm_dir/disk.qcow2"
@@ -964,8 +1026,8 @@ vm_list() {
     
     local vm_count=0
     echo
-    printf "%-15s %-10s %-10s %-10s %-15s %-s\n" "NAME" "STATUS" "ARCH" "IMAGE" "ADDRESS" "CREDENTIALS"
-    printf "%-15s %-10s %-10s %-10s %-15s %-s\n" "----" "------" "----" "-----" "-------" "-----------"
+    printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "NAME" "STATUS" "ARCH" "IMAGE" "HOSTNAME" "CREDENTIALS"
+    printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "----" "------" "----" "-----" "--------" "-----------"
     
     for vm_dir in "$VMS_DIR"/*; do
         if [[ ! -d "$vm_dir" ]]; then
@@ -977,7 +1039,7 @@ vm_list() {
         local pid_file="$vm_dir/qemu.pid"
         
         if [[ ! -f "$info_file" ]]; then
-            printf "%-15s %-10s %-10s %-10s %-15s %-s\n" "$vm_name" "BROKEN" "-" "-" "-" "-"
+            printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "$vm_name" "BROKEN" "-" "-" "-" "-"
             ((vm_count++))
             continue
         fi
@@ -1024,14 +1086,14 @@ vm_list() {
             else
                 ssh_info="127.0.0.1:$port"
             fi
-            credentials="$username:$password"
+            credentials="$username / $password"
         fi
         
         # Get info from JSON file
         local arch=$(grep -o '"arch": "[^"]*"' "$info_file" | cut -d'"' -f4)
         local image=$(grep -o '"image": "[^"]*"' "$info_file" | cut -d'"' -f4)
         
-        printf "%-15s %-10s %-10s %-10s %-15s %-s\n" "$vm_name" "$status" "${arch:-arm64}" "${image:-unknown}" "$ssh_info" "$credentials"
+        printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "$vm_name" "$status" "${arch:-arm64}" "${image:-unknown}" "$ssh_info" "$credentials"
         ((vm_count++))
     done
     
@@ -1451,6 +1513,12 @@ purge() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             --force) force=true; shift ;;
+            --help|-h) 
+                echo "Usage: $0 purge [--force]"
+                echo "  --force    Delete all VMs without confirmation"
+                echo "  --help     Show this help"
+                return 0
+                ;;
             *) error "Unknown option: $1" ;;
         esac
     done
@@ -1497,11 +1565,68 @@ purge() {
     log "Deleted $vm_count VM(s)"
 }
 
+install_command() {
+    local install_path="${1:-/usr/local/bin}"
+    local script_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+    local target_path="$install_path/vm"
+    
+    # Check if script exists
+    if [[ ! -f "$script_path" ]]; then
+        error "Cannot find script at: $script_path"
+    fi
+    
+    # Check if target directory exists and is writable
+    if [[ ! -d "$install_path" ]]; then
+        error "Directory $install_path does not exist"
+    fi
+    
+    # Confirm installation path with user
+    echo "This will install the vm command to: $target_path"
+    if [[ -f "$target_path" ]]; then
+        echo "Warning: File already exists and will be overwritten"
+    fi
+    read -p "Continue? (y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log "Installation cancelled"
+        return
+    fi
+    
+    # Copy script to target location
+    if cp "$script_path" "$target_path" && chmod +x "$target_path"; then
+        log "Successfully installed vm command to: $target_path"
+        echo
+        echo "You can now run: vm --help"
+        echo "Make sure $install_path is in your PATH"
+    else
+        error "Failed to install. You may need to run with sudo: sudo $0 install"
+    fi
+}
+
+uninstall_command() {
+    # Find the vm command in PATH
+    local vm_path
+    if vm_path=$(which vm 2>/dev/null); then
+        echo "Found vm command at: $vm_path"
+        read -p "Remove this file? (y/N): " confirm
+        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            if rm "$vm_path"; then
+                log "Successfully removed vm command from: $vm_path"
+            else
+                error "Failed to remove file. You may need sudo permissions"
+            fi
+        else
+            log "Uninstall cancelled"
+        fi
+    else
+        log "vm command not found in PATH - nothing to uninstall"
+    fi
+}
+
 vm_help() {
     cat <<EOF
-VM Commands:
+VM Manager - Create and manage Linux VMs on macOS
 
-USAGE: $0 vm COMMAND [options]
+USAGE: $0 COMMAND [options]
 
 COMMANDS:
     create              Create and start a new VM
@@ -1511,10 +1636,13 @@ COMMANDS:
     delete VM_NAME      Delete a VM and its files
     ip VM_NAME          Find IP address of a bridge mode VM
     ssh VM_NAME         SSH into a VM
+    purge               Delete all VMs (--force for no confirmation)
+    install             Install to system PATH (/usr/local/bin)
+    uninstall           Remove from system PATH
     help                Show this help
 
 CREATE OPTIONS:
-    --name NAME         VM name (required)
+    --name NAME         VM name (optional - auto-generated if not provided)
     --arch ARCH         Architecture: arm64, amd64 (default: arm64)
     --user USERNAME     Username (default: $DEFAULT_USERNAME)
     --pass PASSWORD     Password (default: auto-generated)
@@ -1527,41 +1655,38 @@ CREATE OPTIONS:
     --debug             Show debug information
 
 EXAMPLES:
-    $0 vm create --name myvm
-    $0 vm create --name myvm --arch amd64 --memory 4G
-    $0 vm list
-    $0 vm start myvm
-    $0 vm ssh myvm
+    $0 create                           # Create VM with random name
+    $0 create --name myvm
+    $0 create --arch amd64 --memory 4G
+    $0 list
+    $0 start myvm
+    $0 ssh myvm
+    $0 install                          # Install to /usr/local/bin
 EOF
 }
 
 
 main() {
-    local entity="${1:-}"
-    local command="${2:-}"
+    local command="${1:-}"
     
-    case "$entity" in
-        vm)
-            shift; [[ $# -gt 0 ]] && shift
-            case "$command" in
-                create)
-                    check_dependencies
-                    mkdir -p "$IMAGES_DIR" "$VMS_DIR"
-                    vm_create "$@"
-                    ;;
-                list) mkdir -p "$VMS_DIR"; vm_list ;;
-                start) check_dependencies; vm_start "$@" ;;
-                stop) vm_stop "$@" ;;
-                delete) vm_delete "$@" ;;
-                ip) vm_ip "$@" ;;
-                ssh) vm_ssh "$@" ;;
-                help|--help|-h|"") vm_help ;;
-                *) error "Unknown VM command: $command" ;;
-            esac
+    case "$command" in
+        create)
+            shift
+            check_dependencies
+            mkdir -p "$IMAGES_DIR" "$VMS_DIR"
+            vm_create "$@"
             ;;
+        list) mkdir -p "$VMS_DIR"; vm_list ;;
+        start) shift; check_dependencies; vm_start "$@" ;;
+        stop) shift; vm_stop "$@" ;;
+        delete) shift; vm_delete "$@" ;;
+        ip) shift; vm_ip "$@" ;;
+        ssh) shift; vm_ssh "$@" ;;
         purge) shift; purge "$@" ;;
-        --help|-h|help|"") usage ;;
-        *) error "Unknown command: $entity" ;;
+        install) shift; install_command "$@" ;;
+        uninstall) shift; uninstall_command "$@" ;;
+        help|--help|-h|"") vm_help ;;
+        *) error "Unknown command: $command. Use '$0 help' for usage information." ;;
     esac
 }
 
