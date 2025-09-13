@@ -159,10 +159,7 @@ export class VmScriptUtils {
         // This could be enhanced to dynamically fetch from the script if it supports listing images
         return [
             'debian13',
-            'debian12',
-            'ubuntu22',
-            'ubuntu20',
-            'alpine'
+            'debian12'
         ];
     }
 
