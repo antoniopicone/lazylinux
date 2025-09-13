@@ -1,0 +1,137 @@
+{
+  "name": "vm-manager",
+  "displayName": "Virtual Machines",
+  "description": "Manage Linux VMs created with the vm script",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vmManager",
+          "title": "Virtual Machines",
+          "icon": "$(device-desktop)"
+        }
+      ]
+    },
+    "views": {
+      "vmManager": [
+        {
+          "id": "vmManagerView",
+          "name": "VMs",
+          "when": "true"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "vmManager.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "vmManager.createVm",
+        "title": "Create VM",
+        "icon": "$(add)"
+      },
+      {
+        "command": "vmManager.startVm",
+        "title": "Start VM",
+        "icon": "$(play)"
+      },
+      {
+        "command": "vmManager.stopVm",
+        "title": "Stop VM",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "vmManager.deleteVm",
+        "title": "Delete VM",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "vmManager.sshVm",
+        "title": "SSH to VM",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "vmManager.getVmIp",
+        "title": "Get VM IP",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "vmManager.copyDetail",
+        "title": "Copy to Clipboard",
+        "icon": "$(copy)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "vmManager.refresh",
+          "when": "view == vmManagerView",
+          "group": "navigation"
+        },
+        {
+          "command": "vmManager.createVm",
+          "when": "view == vmManagerView",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "vmManager.startVm",
+          "when": "view == vmManagerView && viewItem == vm-stopped",
+          "group": "vm@1"
+        },
+        {
+          "command": "vmManager.stopVm",
+          "when": "view == vmManagerView && viewItem == vm-running",
+          "group": "vm@1"
+        },
+        {
+          "command": "vmManager.sshVm",
+          "when": "view == vmManagerView && viewItem == vm-running",
+          "group": "vm@2"
+        },
+        {
+          "command": "vmManager.getVmIp",
+          "when": "view == vmManagerView && viewItem == vm-running",
+          "group": "vm@2"
+        },
+        {
+          "command": "vmManager.deleteVm",
+          "when": "view == vmManagerView && (viewItem == vm-running || viewItem == vm-stopped)",
+          "group": "vm@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Virtual Machines",
+      "properties": {
+        "vmManager.scriptPath": {
+          "type": "string",
+          "default": "/usr/local/bin/vm",
+          "description": "Path to the vm script"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.74.0",
+    "@types/node": "16.x",
+    "typescript": "^4.9.4"
+  }
+}
