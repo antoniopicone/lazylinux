@@ -1,14 +1,29 @@
 {
   "name": "vm-manager",
   "displayName": "Virtual Machines",
-  "description": "Manage Linux VMs created with the vm script",
+  "description": "Manage VMs created with the LazyLinux vm script",
   "version": "0.1.0",
+  "publisher": "Antonio Picone",
+  "author": {
+    "name": "Antonio Picone",
+    "url": "https://github.com/antoniopicone"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antoniopicone/lazylinux.git",
+    "directory": "vscode-vm-manager"
+  },
+  "bugs": {
+    "url": "https://github.com/antoniopicone/lazylinux/issues"
+  },
+  "homepage": "https://github.com/antoniopicone/lazylinux#readme",
   "engines": {
     "vscode": "^1.74.0"
   },
   "categories": [
     "Other"
   ],
+  "icon": "icon.png",
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
@@ -17,7 +32,7 @@
         {
           "id": "vmManager",
           "title": "Virtual Machines",
-          "icon": "$(device-desktop)"
+          "icon": "$(vm)"
         }
       ]
     },
