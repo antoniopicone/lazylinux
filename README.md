@@ -280,16 +280,15 @@ qemu-system-aarch64 --version
 
 ## VS Code Extension
 
-The LazyLinux VM Manager extension provides a graphical interface for managing your VMs directly within Visual Studio Code.
+A VS Code extension for managing Linux VMs created with the `vm` script from LazyLinux. This extension provides a visual interface to view, create, start, stop, and manage virtual machines directly from VS Code.
+
 
 ### Features
 
-- **Visual VM Management**: Tree view of all VMs with their current status
-- **Image Management**: View and manage downloaded images
-- **One-click Operations**: Start, stop, create, and delete VMs with toolbar buttons
-- **SSH Integration**: Quick SSH access with automatic credential copying
-- **Console Access**: Direct console connection for debugging
-- **Status Monitoring**: Real-time VM status updates
+- See all your VMs in the Explorer panel with real-time status and VM details showing hostname, username, and password (hidden)
+- Create VMs with a guided setup: Name → Image → Architecture → Username → Password
+- Multiple architecture supported: arm64 (native) and amd64 (emulated) with performance hints
+- SSH Integration with direct terminal connection with parsed credentials
 
 ### Installation
 
@@ -297,57 +296,95 @@ The LazyLinux VM Manager extension provides a graphical interface for managing y
 
 2. **Install VS Code Extension**:
    ```bash
-   # Clone or navigate to the vscode-plugin directory
-   cd vscode-plugin
-   
+   # Clone or navigate to the vscode-vm-manager directory
+   cd vscode-vm-manager
+
    # Install dependencies and compile
    npm install
    npm run compile
-   
+
    # Package the extension (optional, for distribution)
-   npx vsce package
-   
+   vsce package
+
    # Install the extension locally
-   code --install-extension lazylinux-vm-manager-0.1.0.vsix
-   ```
-   
-   **Alternative: Install from source**:
-   ```bash
-   # Copy the extension to VS Code extensions folder
-   cp -r vscode-plugin ~/.vscode/extensions/lazylinux-vm-manager
-   cd ~/.vscode/extensions/lazylinux-vm-manager
-   npm install && npm run compile
+   code --install-extension vm-manager-0.1.0.vsix
    ```
 
-3. **Reload VS Code** to activate the extension
+3. **Open VS Code** and look for the "Virtual Machines" section in the Explorer panel
 
-### Using the Extension
+### Configuration
 
-1. Open VS Code and look for the **LazyLinux VM Manager** icon in the Activity Bar (sidebar)
-2. The extension provides two main views:
-   - **Virtual Machines**: Shows all VMs with start/stop/delete actions
-   - **Images**: Shows downloaded images with pull/delete actions
+Configure the path to your `vm` script in VS Code settings:
 
-#### Available Actions
+```json
+{
+    "vmManager.scriptPath": "/usr/local/bin/vm"
+}
+```
 
-- **VM Management**:
-  - ➕ Create new VM with guided setup
-  - ▶️ Start/stop VMs with one click
-  - 🗑️ Delete VMs with confirmation
-  - 🔄 Refresh status
-  - 🧹 Purge all VMs and images
+**Default paths tried**:
+- `/usr/local/bin/vm` (if installed to system)
+- `./vm` (in current workspace)
 
-- **Connection Options**:
-  - 💻 SSH connection (copies command to clipboard or opens terminal)
-  - 📺 Console access for debugging
-  - 📋 Automatic credential display
+### Usage
 
-- **Image Management**:
-  - ⬇️ Pull new images (Debian 13 ARM64/AMD64)
-  - 🗑️ Delete unused images
-  - 🔄 Refresh image list
+#### 🚀 Creating VMs
+1. Click the "+" icon in the VM Manager header
+2. **Step 1/5**: Enter VM name (or leave empty for auto-generated)
+3. **Step 2/5**: Select base image (debian13 recommended)
+4. **Step 3/5**: Choose architecture (arm64 for Apple Silicon)
+5. **Step 4/5**: Set username (defaults to "user01")
+6. **Step 5/5**: Set password (leave blank for auto-generated)
 
-The extension automatically detects the `linux` CLI tool and provides a user-friendly interface for all LazyLinux operations.
+### Requirements
+
+- **VS Code**: 1.74.0 or higher
+- **LazyLinux vm script**: Available from [antoniopicone/lazylinux](https://github.com/antoniopicone/lazylinux)
+
+### Architecture Support
+
+- **ARM64**: Native execution on Apple Silicon (recommended)
+- **AMD64/x86_64**: Emulated execution on Apple Silicon
+
+### Network Modes
+
+The extension supports LazyLinux network configurations:
+- **Bridge Mode**: Direct host network access (default)
+- **Port Forwarding**: Localhost port mapping
+
+### Development
+
+#### Building from Source
+```bash
+cd vscode-vm-manager
+npm install
+npm run compile
+vsce package
+```
+
+#### Development Mode
+```bash
+npm run watch  # Auto-compilation during development
+```
+
+#### Testing
+```bash
+# Install locally for testing
+code --install-extension vm-manager-0.1.0.vsix
+```
+
+### Extension Structure
+
+- **`src/extension.ts`**: Main extension entry point and command registration
+- **`src/vmTreeProvider.ts`**: Tree view provider with credential parsing
+- **`src/vmScriptUtils.ts`**: LazyLinux vm script integration and VM operations
+- **`package.json`**: Extension manifest with commands and configuration
+
+### Supported VM Images
+
+The extension supports all LazyLinux-compatible images:
+- **debian13** (default)
+- **debian12**
 
 ## Requirements
 
