@@ -2,6 +2,55 @@ import * as vscode from 'vscode';
 import { VmTreeProvider } from './vmTreeProvider';
 import { VmScriptUtils, VmCreateOptions } from './vmScriptUtils';
 
+async function handleScriptNotFound(context: vscode.ExtensionContext): Promise<void> {
+    const config = vscode.workspace.getConfiguration('vmManager');
+    const currentPath = config.get<string>('scriptPath') || '/usr/local/bin/vm';
+
+    const action = await vscode.window.showErrorMessage(
+        `VM script not found at '${currentPath}'. Please configure the correct path or download the script.`,
+        'Configure Path',
+        'Download Instructions',
+        'Dismiss'
+    );
+
+    if (action === 'Configure Path') {
+        const newPath = await vscode.window.showInputBox({
+            prompt: 'Enter the full path to the vm script',
+            value: currentPath,
+            placeHolder: '/path/to/vm',
+            validateInput: (value) => {
+                if (!value || value.trim() === '') {
+                    return 'Path cannot be empty';
+                }
+                return null;
+            }
+        });
+
+        if (newPath) {
+            await config.update('vmManager.scriptPath', newPath, vscode.ConfigurationTarget.Global);
+            vscode.window.showInformationMessage(`VM script path updated to: ${newPath}`);
+        }
+    } else if (action === 'Download Instructions') {
+        const downloadUrl = 'https://github.com/antoniopicone/lazylinux';
+        const viewRepo = await vscode.window.showInformationMessage(
+            'LazyLinux VM Manager requires the vm script.\n\n' +
+            'Installation steps:\n' +
+            '1. Clone the repository: git clone https://github.com/antoniopicone/lazylinux\n' +
+            '2. Copy or symlink the vm script to /usr/local/bin/vm\n' +
+            '3. Make it executable: chmod +x /usr/local/bin/vm\n' +
+            '4. Or configure a custom path in settings',
+            'Open Repository',
+            'Open Settings'
+        );
+
+        if (viewRepo === 'Open Repository') {
+            vscode.env.openExternal(vscode.Uri.parse(downloadUrl));
+        } else if (viewRepo === 'Open Settings') {
+            vscode.commands.executeCommand('workbench.action.openSettings', 'vmManager.scriptPath');
+        }
+    }
+}
+
 export function activate(context: vscode.ExtensionContext) {
     const scriptUtils = new VmScriptUtils();
     const vmTreeProvider = new VmTreeProvider(scriptUtils);
@@ -10,6 +59,16 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.createTreeView('vmManagerView', {
         treeDataProvider: vmTreeProvider,
         showCollapseAll: false
+    });
+
+    // Auto-refresh VM list every 10 seconds
+    const refreshInterval = setInterval(() => {
+        vmTreeProvider.refresh();
+    }, 10000);
+
+    // Clean up interval on deactivation
+    context.subscriptions.push({
+        dispose: () => clearInterval(refreshInterval)
     });
 
     // Register commands
@@ -104,8 +163,12 @@ export function activate(context: vscode.ExtensionContext) {
                     `Image: ${selectedImage}, Architecture: ${archDisplay}\n` +
                     `User: ${userDisplay}, Password: ${passDisplay}`
                 );
-            } catch (error) {
-                vscode.window.showErrorMessage(`Failed to create VM: ${error}`);
+            } catch (error: any) {
+                if (error.message === 'VM_SCRIPT_NOT_FOUND') {
+                    await handleScriptNotFound(context);
+                } else {
+                    vscode.window.showErrorMessage(`Failed to create VM: ${error}`);
+                }
             }
         }),
 
@@ -125,8 +188,12 @@ export function activate(context: vscode.ExtensionContext) {
 
                 vmTreeProvider.refresh();
                 vscode.window.showInformationMessage(`VM ${vm.name} started successfully`);
-            } catch (error) {
-                vscode.window.showErrorMessage(`Failed to start VM: ${error}`);
+            } catch (error: any) {
+                if (error.message === 'VM_SCRIPT_NOT_FOUND') {
+                    await handleScriptNotFound(context);
+                } else {
+                    vscode.window.showErrorMessage(`Failed to start VM: ${error}`);
+                }
             }
         }),
 
@@ -146,8 +213,12 @@ export function activate(context: vscode.ExtensionContext) {
 
                 vmTreeProvider.refresh();
                 vscode.window.showInformationMessage(`VM ${vm.name} stopped successfully`);
-            } catch (error) {
-                vscode.window.showErrorMessage(`Failed to stop VM: ${error}`);
+            } catch (error: any) {
+                if (error.message === 'VM_SCRIPT_NOT_FOUND') {
+                    await handleScriptNotFound(context);
+                } else {
+                    vscode.window.showErrorMessage(`Failed to stop VM: ${error}`);
+                }
             }
         }),
 
@@ -174,8 +245,12 @@ export function activate(context: vscode.ExtensionContext) {
 
                     vmTreeProvider.refresh();
                     vscode.window.showInformationMessage(`VM ${vm.name} deleted successfully`);
-                } catch (error) {
-                    vscode.window.showErrorMessage(`Failed to delete VM: ${error}`);
+                } catch (error: any) {
+                    if (error.message === 'VM_SCRIPT_NOT_FOUND') {
+                        await handleScriptNotFound(context);
+                    } else {
+                        vscode.window.showErrorMessage(`Failed to delete VM: ${error}`);
+                    }
                 }
             }
         }),
@@ -206,8 +281,12 @@ export function activate(context: vscode.ExtensionContext) {
                 } else {
                     vscode.window.showWarningMessage(`Could not determine IP for VM ${vm.name}`);
                 }
-            } catch (error) {
-                vscode.window.showErrorMessage(`Failed to get VM IP: ${error}`);
+            } catch (error: any) {
+                if (error.message === 'VM_SCRIPT_NOT_FOUND') {
+                    await handleScriptNotFound(context);
+                } else {
+                    vscode.window.showErrorMessage(`Failed to get VM IP: ${error}`);
+                }
             }
         }),
 

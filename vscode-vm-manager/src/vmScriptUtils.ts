@@ -31,10 +31,15 @@ export class VmScriptUtils {
         return config.get<string>('scriptPath') || './vm';
     }
 
+    // Sanitize VM name: replace underscores with hyphens (matches vm script behavior)
+    private sanitizeName(name: string): string {
+        return name.replace(/_/g, '-');
+    }
+
     private async executeCommand(args: string[]): Promise<string> {
         const scriptPath = this.getScriptPath();
         const command = `${scriptPath} ${args.join(' ')}`;
-        
+
         try {
             const { stdout, stderr } = await execAsync(command);
             if (stderr) {
@@ -42,7 +47,22 @@ export class VmScriptUtils {
             }
             return stdout.trim();
         } catch (error: any) {
+            // Check if the error is due to script not being found
+            if (error.message.includes('command not found') ||
+                error.message.includes('No such file or directory') ||
+                error.code === 'ENOENT') {
+                throw new Error('VM_SCRIPT_NOT_FOUND');
+            }
             throw new Error(error.message || 'Command execution failed');
+        }
+    }
+
+    async checkScriptAvailability(): Promise<boolean> {
+        try {
+            await this.executeCommand(['--version']);
+            return true;
+        } catch (error: any) {
+            return false;
         }
     }
 
@@ -81,12 +101,17 @@ export class VmScriptUtils {
                 const hostname = parts[4];
                 const credentials = parts.slice(5).join(' ');
 
+                // The hostname in the list is the sanitized version (underscores replaced)
+                // If hostname is '-', use sanitized name + '.local'
+                const sanitizedName = this.sanitizeName(name);
+                const actualHostname = hostname === '-' ? `${sanitizedName}.local` : hostname;
+
                 vms.push({
                     name,
                     status,
                     arch: arch === '-' ? 'unknown' : arch,
                     image: image === '-' ? 'unknown' : image,
-                    hostname: hostname === '-' ? name + '.local' : hostname,
+                    hostname: actualHostname,
                     credentials: credentials === '-' ? 'unknown' : credentials,
                     uptime: status === 'RUNNING' ? 'Active' : undefined
                 });
@@ -138,15 +163,15 @@ export class VmScriptUtils {
 
     async getVmIp(name: string): Promise<string> {
         const output = await this.executeCommand(['ip', name]);
-        
-        // Extract IP from output
-        const ipMatch = output.match(/Found IP: (\d+\.\d+\.\d+\.\d+)/);
+
+        // Extract IP from output - new format: "VM 'name' IP Address: 192.168.105.20"
+        const ipMatch = output.match(/IP Address: (\d+\.\d+\.\d+\.\d+)/);
         if (ipMatch) {
             return ipMatch[1];
         }
 
-        // Check for port forwarding
-        const portMatch = output.match(/ssh user@127\.0\.0\.1 -p (\d+)/);
+        // Check for port forwarding - format: "ssh user@127.0.0.1 -p PORT"
+        const portMatch = output.match(/ssh.*@127\.0\.0\.1.*-p\s+(\d+)/);
         if (portMatch) {
             return `127.0.0.1:${portMatch[1]}`;
         }

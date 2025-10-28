@@ -16,3 +16,5 @@ package-lock.json
 /vscode-plugin/out
 *.vsix
 out
+CLAUDE.md
+logs/

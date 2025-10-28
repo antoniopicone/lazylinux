@@ -3,7 +3,7 @@
   "displayName": "Virtual Machines",
   "description": "Manage VMs created with the LazyLinux vm script",
   "version": "0.1.0",
-  "publisher": "Antonio Picone",
+  "publisher": "antoniopicone",
   "author": {
     "name": "Antonio Picone",
     "url": "https://github.com/antoniopicone"

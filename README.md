@@ -27,13 +27,18 @@ Install Homebrew if you don't have it:
 ### Install the VM CLI
 
 ```bash
-# Download, make executable, and install
+# Download and make executable
 curl -o vm https://raw.githubusercontent.com/antoniopicone/lazylinux/refs/heads/main/vm
 chmod +x vm
 
-# Install to system PATH (optional)
+# Install to system PATH (also configures bridge networking)
 ./vm install
 ```
+
+The `install` command will:
+- Copy the vm script to `/usr/local/bin/vm`
+- Set up bridge networking (socket_vmnet) for macOS
+- Configure passwordless sudo for socket_vmnet commands
 
 Verify installation:
 ```bash
@@ -55,6 +60,8 @@ vm create --name myvm --memory 4G --cpus 4 --disk 20G
 vm create --name myvm-amd64 --arch amd64
 ```
 
+**Note**: VM names with underscores will be automatically converted to hyphens for DNS compliance (e.g., `my_vm` → `my-vm`). You'll be prompted to confirm the conversion.
+
 ### 2. Manage VMs
 
 ```bash
@@ -74,10 +81,10 @@ vm delete myvm
 ### 3. System operations
 
 ```bash
-# Install vm command to system PATH
+# Install vm command to system PATH (includes bridge networking setup)
 vm install
 
-# Remove vm command from system PATH  
+# Remove vm command from system PATH
 vm uninstall
 ```
 
@@ -130,7 +137,7 @@ vm delete VM_NAME
 ### System Commands
 
 ```bash
-# Install vm command to system PATH
+# Install vm command to system PATH (includes bridge networking setup)
 vm install
 
 # Remove vm command from system PATH
@@ -175,6 +182,8 @@ vm create --name secure --user admin --pass mypassword
 vm create --name dev-amd64 --arch amd64
 ```
 
+**Note**: If you use underscores in VM names (e.g., `k3s_node1`), the script will suggest converting them to hyphens (`k3s-node1`) for RFC-compliant hostnames. You'll be prompted to accept or cancel.
+
 ### Working with VMs
 
 ```bash
@@ -209,7 +218,7 @@ vm ip myvm
 vm purge --force
 
 # Install/uninstall system command
-vm install      # Install to /usr/local/bin
+vm install      # Install to /usr/local/bin and configure bridge networking
 vm uninstall    # Remove from PATH
 ```
 
@@ -261,6 +270,10 @@ qemu-system-aarch64 --version
    vm start myvm --show-console
    ```
 
+### VM Creation Takes Long Time
+
+Bridge mode VMs need to obtain an IP address via DHCP, which can take up to 90 seconds. The script will show a message "VM booted, waiting for network DHCP to assign IP..." during this phase. This is normal behavior.
+
 ### SSH Connection Issues
 
 1. Ensure the VM is fully booted:
@@ -285,10 +298,12 @@ A VS Code extension for managing Linux VMs created with the `vm` script from Laz
 
 ### Features
 
-- See all your VMs in the Explorer panel with real-time status and VM details showing hostname, username, and password (hidden)
+- See all your VMs in the Explorer panel with real-time status (auto-refreshes every 10 seconds)
+- VM details showing hostname, username, and password (hidden)
 - Create VMs with a guided setup: Name → Image → Architecture → Username → Password
 - Multiple architecture supported: arm64 (native) and amd64 (emulated) with performance hints
 - SSH Integration with direct terminal connection with parsed credentials
+- Automatic hostname sanitization for VMs with underscores (e.g., `k3s_node1` → `k3s-node1.local`)
 
 ### Installation
 

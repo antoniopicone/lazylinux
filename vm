@@ -55,6 +55,12 @@ error() {
     exit 1
 }
 
+# Sanitize hostname: replace underscores with hyphens (RFC 952/1123 compliance)
+sanitize_hostname() {
+    local name="$1"
+    echo "${name//_/-}"
+}
+
 # Progress indicator functions
 show_progress() {
     local message="$1"
@@ -224,6 +230,64 @@ check_socket_vmnet() {
     return 1
 }
 
+extract_vm_ip_from_log() {
+    local console_log="$1"
+    local max_wait="${2:-60}"  # Wait up to 60 seconds by default
+    local elapsed=0
+
+    while [[ $elapsed -lt $max_wait ]]; do
+        if [[ -f "$console_log" ]]; then
+            # Look for cloud-init network info line with IP address
+            # Format: ci-info: | enp0s1 | True |       192.168.105.18       | ...
+            local ip=$(grep "ci-info.*enp0s1.*True" "$console_log" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+
+            if [[ -n "$ip" && "$ip" != "0.0.0.0" ]]; then
+                echo "$ip"
+                return 0
+            fi
+
+            # Also check if cloud-init is ready (means network is configured)
+            if grep -q "CLOUD-INIT-READY" "$console_log" 2>/dev/null; then
+                # Cloud-init finished, try one more time
+                ip=$(grep "ci-info.*enp0s1.*True" "$console_log" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+                if [[ -n "$ip" && "$ip" != "0.0.0.0" ]]; then
+                    echo "$ip"
+                    return 0
+                fi
+            fi
+        fi
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    return 1
+}
+
+update_vm_ip_in_info() {
+    local info_file="$1"
+    local ip_address="$2"
+
+    if [[ ! -f "$info_file" ]]; then
+        return 1
+    fi
+
+    # Create a temporary file with updated IP
+    local temp_file=$(mktemp)
+
+    # Read the current info.json and update the IP in ssh.host
+    if command -v jq >/dev/null 2>&1; then
+        # Use jq if available (more reliable)
+        jq --arg ip "$ip_address" '.ssh.host = $ip' "$info_file" > "$temp_file"
+    else
+        # Fallback: use sed
+        sed "s/\"host\": \"[^\"]*\"/\"host\": \"$ip_address\"/" "$info_file" > "$temp_file"
+    fi
+
+    # Replace the original file
+    mv "$temp_file" "$info_file"
+}
+
 detect_primary_network_interface() {
     # Detect the best network interface for bridge networking
     # Priority: Ethernet adapters (en5, en4, etc) > en0 (often WiFi)
@@ -268,38 +332,7 @@ is_wifi_interface() {
 }
 
 setup_bridge_networking() {
-    local configure_sudo=false
-
-    # Parse arguments
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --configure-sudo)
-                configure_sudo=true
-                shift
-                ;;
-            --help|-h)
-                cat <<EOF
-Usage: $0 setup-bridge [--configure-sudo]
-
-Setup bridge networking for VMs using socket_vmnet.
-
-Options:
-    --configure-sudo    Configure sudo to not require password for socket_vmnet_client
-                        This allows VM creation without password prompts (optional)
-    --help, -h          Show this help message
-
-Without --configure-sudo, you will need to enter your password each time you
-create or start a VM with bridge networking.
-EOF
-                return 0
-                ;;
-            *)
-                error "Unknown option: $1. Use '$0 setup-bridge --help' for usage."
-                ;;
-        esac
-    done
-
-    echo "Setting up bridge networking (requires sudo password once)..."
+    echo "Setting up bridge networking with passwordless sudo (requires sudo password once)..."
     echo
 
     # Check if socket_vmnet is installed
@@ -408,58 +441,49 @@ EOF
         echo "VMs will be bridged to interface: $primary_interface ($interface_ip)"
         echo
 
-        # Configure sudo if requested
-        if [[ "$configure_sudo" == "true" ]]; then
-            local sudoers_file="/etc/sudoers.d/socket_vmnet_client"
+        # Configure passwordless sudo (always)
+        local sudoers_file="/etc/sudoers.d/socket_vmnet_client"
 
-            echo "Configuring sudo to allow passwordless execution of socket_vmnet_client..."
-            echo
-            echo -e "${YELLOW}WARNING:${NC} This will allow your user to run socket_vmnet_client without password."
-            echo "This is generally safe as it only affects this specific command."
-            echo
-            echo "The following line will be added to $sudoers_file:"
-            echo "  $USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT"
-            echo
-            read -p "Continue? (y/N): " confirm
+        echo "Configuring sudo to allow passwordless execution of socket_vmnet_client..."
+        echo
+        echo -e "${YELLOW}INFO:${NC} This will allow your user to run socket_vmnet_client without password."
+        echo "This is safe as it only affects this specific command."
+        echo
+        echo "The following line will be added to $sudoers_file:"
+        echo "  $USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT"
+        echo
+        read -p "Continue? (Y/n): " confirm
 
-            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-                if echo "$USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT" | sudo tee "$sudoers_file" > /dev/null; then
-                    # Set correct permissions on sudoers file
-                    sudo chmod 0440 "$sudoers_file"
+        if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+            echo "Setup cancelled."
+            echo
+            echo "Note: Without passwordless sudo, you will be prompted for your password"
+            echo "every time you create or start a VM with bridge networking."
+            return 1
+        fi
 
-                    # Validate sudoers file
-                    if sudo visudo -c -f "$sudoers_file" >/dev/null 2>&1; then
-                        echo -e "${GREEN}✔${NC} Sudo configuration successful!"
-                        echo "You can now create VMs without password prompts:"
-                        echo "  $0 create --net-type bridge"
-                    else
-                        echo -e "${RED}✗${NC} Sudoers file validation failed! Removing invalid file..."
-                        sudo rm -f "$sudoers_file"
-                        error "Failed to configure sudo. Please check permissions."
-                    fi
-                else
-                    error "Failed to write sudoers file"
-                fi
+        if echo "$USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT" | sudo tee "$sudoers_file" > /dev/null; then
+            # Set correct permissions on sudoers file
+            sudo chmod 0440 "$sudoers_file"
+
+            # Validate sudoers file
+            if sudo visudo -c -f "$sudoers_file" >/dev/null 2>&1; then
+                echo -e "${GREEN}✔${NC} Sudo configuration successful!"
+                echo
+                echo "You can now create VMs without password prompts:"
+                echo "  $0 create --net-type bridge"
             else
-                echo "Sudo configuration skipped."
-                echo
-                echo "Note: VM creation with bridge networking requires sudo access to socket_vmnet_client."
-                echo "You will be prompted for your password when creating or starting VMs."
-                echo
-                echo "To configure sudo later, run:"
-                echo "  $0 setup-bridge --configure-sudo"
+                echo -e "${RED}✗${NC} Sudoers file validation failed! Removing invalid file..."
+                sudo rm -f "$sudoers_file"
+                error "Failed to configure sudo. Please check permissions."
             fi
         else
-            echo "Note: VM creation with bridge networking requires sudo access to socket_vmnet_client."
-            echo "You will be prompted for your password when creating or starting VMs."
-            echo
-            echo "To avoid password prompts, run:"
-            echo "  $0 setup-bridge --configure-sudo"
+            error "Failed to write sudoers file"
         fi
 
         echo
-        echo "You can now create VMs with bridge networking:"
-        echo "  $0 create --net-type bridge"
+        echo "Bridge networking is fully configured!"
+        echo "You can now create VMs with: $0 create --net-type bridge"
     else
         echo -e "${YELLOW}[!]${NC} socket_vmnet service reported as running but socket ${SOCKET_VMNET_SOCKET} not found."
         echo "The service may need more time to initialize or may need a restart."
@@ -1081,6 +1105,7 @@ usage() {
 Usage: $0 COMMAND [options]
 
 Commands:
+    install             Install vm command + setup bridge networking
     create              Create and start a new VM
     list                List all VMs and their status
     start VM_NAME       Start an existing VM
@@ -1089,14 +1114,13 @@ Commands:
     ip VM_NAME          Find IP address of a bridge mode VM
     ssh VM_NAME         SSH into a VM
     purge               Delete all VMs (--force for no confirmation)
-    setup-bridge        Setup bridge networking (one-time, requires sudo)
     diagnose            Run network diagnostics
-    install             Install vm command to system PATH
     uninstall           Remove vm command from system PATH
     help                Show detailed help
 
 Create options:
     --name NAME         VM name (optional - auto-generated if not provided)
+                        Note: Underscores will be converted to hyphens for hostname compliance
     --arch ARCH         Architecture (default: arm64, options: arm64, amd64)
     --user USERNAME     Username (default: $DEFAULT_USERNAME)
     --pass PASSWORD     Password (default: auto-generated)
@@ -1109,15 +1133,15 @@ Create options:
     --debug             Show debug information including QEMU command
 
 Examples:
-    $0 setup-bridge                     # Setup bridge networking (one-time)
+    $0 install                          # Install + setup bridge networking (one-time)
     $0 create                           # Create VM with auto-generated name
     $0 create --name myvm
     $0 create --arch amd64 --memory 4G
     $0 list
     $0 start myvm
     $0 ssh myvm
+    $0 diagnose                         # Check network configuration
     $0 purge --force
-    $0 install                          # Install to /usr/local/bin
 EOF
 }
 
@@ -1201,12 +1225,30 @@ vm_create() {
     if [[ -z "$name" ]]; then
         name=$(generate_random_vm_name)
     fi
-    
+
+    # Check if VM name contains underscores (not RFC 952/1123 compliant)
+    if [[ "$name" == *"_"* ]]; then
+        local sanitized_name="${name//_/-}"
+        echo -e "${YELLOW}[!]${NC} VM name contains underscores which are not valid in hostnames"
+        echo "    Requested name: $name"
+        echo "    Suggested name: $sanitized_name"
+        echo
+        read -p "Use suggested name '$sanitized_name'? (Y/n): " use_suggested
+
+        if [[ "$use_suggested" == "n" || "$use_suggested" == "N" ]]; then
+            error "VM creation cancelled. Please choose a hostname-compliant name (no underscores)."
+        else
+            echo "Using sanitized name: $sanitized_name"
+            name="$sanitized_name"
+            echo
+        fi
+    fi
+
     # Validate architecture
     if [[ "$arch" != "arm64" && "$arch" != "amd64" && "$arch" != "x86_64" ]]; then
         error "Invalid architecture: $arch. Options: arm64, amd64"
     fi
-    
+
     # Normalize architecture
     [[ "$arch" == "x86_64" ]] && arch="amd64"
 
@@ -1217,7 +1259,7 @@ vm_create() {
 
     [[ -z "$password" ]] && password=$(generate_password 16)
     [[ -z "$ssh_port" ]] && ssh_port=$(find_free_port)
-    
+
     local vm_dir="$VMS_DIR/$name"
     
     # Set global variables for cleanup
@@ -1290,16 +1332,8 @@ vm_create() {
         fi
     fi
     
-    # Warn if VM name contains underscores (will be sanitized to hyphens)
-    if [[ "$name" == *"_"* ]]; then
-        local sanitized_name="${name//_/-}"
-        echo -e "${YELLOW}[!]${NC} VM name contains underscores which are not valid in hostnames"
-        echo "    Hostname will be sanitized to: $sanitized_name"
-        echo "    SSH access will be: ssh $username@${sanitized_name}.local"
-        echo
-    fi
-
     # Create cloud-init seed (suppress output)
+    # Note: VM name is already sanitized at the beginning of vm_create
     local seed_iso
     if ! seed_iso=$(create_cloud_init "$vm_dir" "$username" "$password" "$name" "$net_type" 2>/dev/null); then
         show_error "Failed to create cloud-init configuration"
@@ -1418,8 +1452,12 @@ EOF
             "-display" "none"
             "-serial" "file:$console_log"
             "-monitor" "none"
-            "-pidfile" "$pid_file"
         )
+
+        # Only add pidfile for non-bridge mode (bridge mode runs as root, can't write to user dir)
+        if [[ "$net_type" != "bridge" ]]; then
+            qemu_args+=("-pidfile" "$pid_file")
+        fi
         
         # Try to start QEMU, with retry logic for port conflicts
         local max_retries=5
@@ -1431,6 +1469,8 @@ EOF
             if [[ "$net_type" == "bridge" ]]; then
                 if sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}" >/dev/null 2>&1; then
                     qemu_success=true
+                    # Note: QEMU will create the PID file automatically (as root)
+                    # Our commands use fallback with pgrep if PID file can't be read
                     break
                 fi
             else
@@ -1489,8 +1529,22 @@ EOF
             trap - SIGINT
             CURRENT_VM_NAME=""
             CURRENT_VM_DIR=""
+
+            # Extract IP address from console log for bridge mode VMs
             if [[ "$net_type" == "bridge" ]]; then
-                show_success "$name" "$username" "$password" ""
+                echo -ne "\r\033[K"  # Clear the progress line
+                echo -ne "${DARK_YELLOW}⠋${NC} VM booted, waiting for network DHCP to assign IP..."
+
+                local detected_ip=$(extract_vm_ip_from_log "$console_log" 90)
+                if [[ -n "$detected_ip" ]]; then
+                    # Update info.json with the detected IP
+                    update_vm_ip_in_info "$info_json" "$detected_ip"
+                    echo -ne "\r\033[K"  # Clear the waiting message
+                    show_success "$name" "$username" "$password" "IP Address: $detected_ip"
+                else
+                    echo -ne "\r\033[K"  # Clear the waiting message
+                    show_success "$name" "$username" "$password" ""
+                fi
             else
                 show_success "$name" "$username" "$password" "(Alternative: ssh $username@127.0.0.1 -p $ssh_port)"
             fi
@@ -1573,7 +1627,8 @@ vm_list() {
             [[ -z "$net_type" ]] && net_type="portfwd"
             
             if [[ "$net_type" == "bridge" ]]; then
-                ssh_info="$vm_name.local"
+                local sanitized_hostname=$(sanitize_hostname "$vm_name")
+                ssh_info="${sanitized_hostname}.local"
             else
                 ssh_info="127.0.0.1:$port"
             fi
@@ -1787,6 +1842,8 @@ vm_start() {
             bridge_success=0
             if sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}" 2>/dev/null; then
                 bridge_success=0
+                # Note: QEMU will create the PID file automatically (as root)
+                # Our commands use fallback with pgrep if PID file can't be read
             else
                 bridge_success=1
             fi
@@ -1804,8 +1861,17 @@ vm_start() {
                 show_progress "Starting VM" "$name"
                 if wait_for_cloud_init "$console_log" 300 "$name"; then
                     touch "$first_boot_marker"
+
+                    # Extract IP address from console log for bridge mode VMs
                     if [[ "$net_type" == "bridge" ]]; then
-                        show_success "$name" "$username" "$password" ""
+                        local detected_ip=$(extract_vm_ip_from_log "$console_log" 90)
+                        if [[ -n "$detected_ip" ]]; then
+                            # Update info.json with the detected IP
+                            update_vm_ip_in_info "$info_file" "$detected_ip"
+                            show_success "$name" "$username" "$password" "IP Address: $detected_ip"
+                        else
+                            show_success "$name" "$username" "$password" ""
+                        fi
                     else
                         show_success "$name" "$username" "$password" "(Alternative: ssh $username@127.0.0.1 -p $ssh_port)"
                     fi
@@ -1860,36 +1926,23 @@ vm_stop() {
     fi
     
     log "Stopping VM: $name (PID: $pid)"
-
-    # Check if process is owned by root (requires sudo)
-    local process_owner=$(ps -o user= -p "$pid" 2>/dev/null)
-    local use_sudo=false
-
-    if [[ "$process_owner" == "root" ]]; then
-        log "VM process is running as root, using sudo..."
-        use_sudo=true
-    fi
-
-    # Try to stop the VM gracefully
-    local kill_cmd="kill"
-    [[ "$use_sudo" == "true" ]] && kill_cmd="sudo kill"
-
-    if $kill_cmd -TERM "$pid" 2>/dev/null; then
+    
+    if kill -TERM "$pid" 2>/dev/null; then
         local count=0
         local timeout=30
-
+        
         log "Sending graceful shutdown signal..."
         while [[ $count -lt $timeout ]] && kill -0 "$pid" 2>/dev/null; do
             sleep 1
             ((count++))
         done
-
+        
         if kill -0 "$pid" 2>/dev/null; then
             log "Graceful shutdown timed out, forcing stop..."
-            $kill_cmd -KILL "$pid" 2>/dev/null
+            kill -KILL "$pid" 2>/dev/null
             sleep 2
         fi
-
+        
         if ! kill -0 "$pid" 2>/dev/null; then
             log "VM stopped successfully"
             rm -f "$pid_file"
@@ -1897,7 +1950,7 @@ vm_stop() {
             error "Failed to stop VM"
         fi
     else
-        error "Failed to send stop signal to VM (try: sudo ./vm stop $name)"
+        error "Failed to send stop signal to VM"
     fi
 }
 
@@ -1920,22 +1973,54 @@ vm_ip() {
     fi
     
     local pid_file="$vm_dir/qemu.pid"
-    if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-        echo "VM '$name' is not running"
-        return
+    local pid=""
+    if [[ -f "$pid_file" ]]; then
+        pid=$(cat "$pid_file" 2>/dev/null)
+    fi
+
+    # Fallback: search for process by name if PID file doesn't exist or is invalid
+    if [[ -z "$pid" ]] || ! ps -p "$pid" > /dev/null 2>&1; then
+        pid=$(pgrep -f "qemu.*-name $name" | head -1)
+        if [[ -z "$pid" ]]; then
+            echo "VM '$name' is not running"
+            return
+        fi
     fi
     
     local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
-    echo "Searching for IP address of bridge VM '$name'..."
-    
-    local detected_ip
-    if detected_ip=$(detect_bridge_vm_ip "$name" "$username"); then
+    local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    local sanitized_hostname=$(sanitize_hostname "$name")
+
+    # Try to read IP from info.json first (cached from boot)
+    local cached_ip=$(grep -o '"host": "[^"]*"' "$info_file" | cut -d'"' -f4)
+
+    if [[ -n "$cached_ip" && "$cached_ip" != "dhcp-assigned" ]]; then
+        echo "VM '$name' IP Address: $cached_ip"
+        echo "Connect with: ssh $username@$cached_ip"
+        echo "Or use mDNS: ssh $username@${sanitized_hostname}.local"
+        echo "Password: $password"
+        return 0
+    fi
+
+    # Fallback: try to extract from console log
+    echo "Searching for IP address in VM console log..."
+    local console_log="$vm_dir/console.log"
+    local detected_ip=$(extract_vm_ip_from_log "$console_log" 5)
+
+    if [[ -n "$detected_ip" ]]; then
+        # Update info.json for future use
+        update_vm_ip_in_info "$info_file" "$detected_ip"
         echo "Found IP: $detected_ip"
         echo "Connect with: ssh $username@$detected_ip"
-        local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+        echo "Or use mDNS: ssh $username@${sanitized_hostname}.local"
         echo "Password: $password"
     else
-        echo "Could not detect IP address. Check console log: cat $vm_dir/console.log"
+        # Last resort: use mDNS
+        echo "Could not extract IP from console log"
+        echo "Try mDNS: ssh $username@${sanitized_hostname}.local"
+        echo "Password: $password"
+        echo
+        echo "Or check console log manually: cat $vm_dir/console.log | grep ci-info"
     fi
 }
 
@@ -2080,30 +2165,49 @@ install_command() {
     local install_path="${1:-/usr/local/bin}"
     local script_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
     local target_path="$install_path/vm"
-    
+
+    echo "========================================"
+    echo "  LazyLinux VM Manager Installation"
+    echo "========================================"
+    echo
+
     if [[ ! -f "$script_path" ]]; then
         error "Cannot find script at: $script_path"
     fi
-    
+
     if [[ ! -d "$install_path" ]]; then
         error "Directory $install_path does not exist"
     fi
-    
-    echo "This will install the vm command to: $target_path"
+
+    echo "Step 1: Installing vm command to $target_path"
     if [[ -f "$target_path" ]]; then
         echo "Warning: File already exists and will be overwritten"
     fi
-    read -p "Continue? (y/N): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    read -p "Continue with installation? (Y/n): " confirm
+    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
         log "Installation cancelled"
         return
     fi
-    
+
     if cp "$script_path" "$target_path" && chmod +x "$target_path"; then
-        log "Successfully installed vm command to: $target_path"
+        echo -e "${GREEN}✔${NC} Successfully installed vm command to: $target_path"
+        echo
+
+        # Run bridge networking setup
+        echo "Step 2: Setting up bridge networking..."
+        echo
+        setup_bridge_networking
+
+        echo
+        echo "========================================"
+        echo -e "${GREEN}✔ Installation Complete!${NC}"
+        echo "========================================"
         echo
         echo "You can now run: vm --help"
         echo "Make sure $install_path is in your PATH"
+        echo
+        echo "To create your first VM:"
+        echo "  vm create --name myvm"
     else
         error "Failed to install. You may need to run with sudo: sudo $0 install"
     fi
@@ -2135,6 +2239,7 @@ VM Manager - Create and manage Linux VMs on macOS
 USAGE: $0 COMMAND [options]
 
 COMMANDS:
+    install             Install vm command + setup bridge networking
     create              Create and start a new VM
     list                List all VMs and their status
     start VM_NAME       Start an existing VM
@@ -2143,14 +2248,13 @@ COMMANDS:
     ip VM_NAME          Find IP address of a bridge mode VM
     ssh VM_NAME         SSH into a VM
     purge               Delete all VMs (--force for no confirmation)
-    setup-bridge        Setup bridge networking (one-time, requires sudo)
     diagnose            Run network diagnostics
-    install             Install to system PATH (/usr/local/bin)
     uninstall           Remove from system PATH
     help                Show this help
 
 CREATE OPTIONS:
     --name NAME         VM name (optional - auto-generated if not provided)
+                        Note: Underscores will be converted to hyphens for hostname compliance
     --arch ARCH         Architecture: arm64, amd64 (default: arm64)
     --user USERNAME     Username (default: $DEFAULT_USERNAME)
     --pass PASSWORD     Password (default: auto-generated)
@@ -2164,13 +2268,9 @@ CREATE OPTIONS:
 
 NETWORK TYPES:
     bridge          Bridged networking - VMs get IP from your network DHCP
-                    • Requires socket_vmnet (run: ./vm setup-bridge)
-                    • Requires sudo password when starting VMs (unless configured)
+                    • Automatically configured during installation
                     • VMs accessible via mDNS: ssh user@hostname.local
                     • Best for: VM-to-VM communication, network services
-
-                    To avoid sudo password prompts (recommended):
-                    ./vm setup-bridge --configure-sudo
 
     portfwd         Port forwarding - SSH via localhost ports
                     • No special setup required
@@ -2178,18 +2278,26 @@ NETWORK TYPES:
                     • VMs accessible via: ssh user@127.0.0.1 -p PORT
                     • Best for: Development, single VM access
 
+INSTALLATION:
+    First-time setup (installs vm command + configures bridge networking):
+        $0 install
+
+    This will:
+        1. Install vm command to /usr/local/bin
+        2. Install and configure socket_vmnet for bridge networking
+        3. Configure passwordless sudo for VM operations
+
 EXAMPLES:
-    $0 setup-bridge                         # Setup bridge networking (one-time)
-    $0 setup-bridge --configure-sudo        # Setup + configure passwordless sudo
+    $0 install                              # First-time installation + setup
     $0 diagnose                             # Check network configuration
     $0 create                               # Create VM with random name (bridge mode)
     $0 create --name myvm
     $0 create --net-type portfwd            # Create VM with port forwarding
     $0 create --arch amd64 --memory 4G
     $0 list
-    $0 start myvm                           # Will ask for sudo if bridge mode (unless configured)
+    $0 start myvm
     $0 ssh myvm
-    $0 install                              # Install to /usr/local/bin
+    $0 ip myvm                              # Get VM IP address
 EOF
 }
 
@@ -2210,7 +2318,6 @@ main() {
         ip) shift; vm_ip "$@" ;;
         ssh) shift; vm_ssh "$@" ;;
         purge) shift; purge "$@" ;;
-        setup-bridge) shift; setup_bridge_networking "$@" ;;
         diagnose) diagnose_network ;;
         install) shift; install_command "$@" ;;
         uninstall) shift; uninstall_command "$@" ;;
