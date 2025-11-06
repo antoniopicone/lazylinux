@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
 import { spawn, exec } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 const execAsync = promisify(exec);
 
@@ -10,7 +13,10 @@ export interface VmInfo {
     arch: string;
     image: string;
     hostname: string;
-    credentials: string;
+    ipAddress: string;
+    username: string;
+    password: string;
+    sshPort: string;
     uptime?: string;
 }
 
@@ -68,57 +74,148 @@ export class VmScriptUtils {
 
     async listVms(): Promise<VmInfo[]> {
         try {
-            const output = await this.executeCommand(['list']);
-            return this.parseVmList(output);
+            return await this.loadVmsFromDisk();
         } catch (error) {
             console.error('Failed to list VMs:', error);
             return [];
         }
     }
 
-    private parseVmList(output: string): VmInfo[] {
-        const lines = output.split('\n').filter(line => line.trim());
+    private async loadVmsFromDisk(): Promise<VmInfo[]> {
         const vms: VmInfo[] = [];
+        const vmDir = path.join(os.homedir(), '.vm', 'vms');
 
-        // Skip header lines and empty lines
-        let dataStarted = false;
-        for (const line of lines) {
-            if (line.includes('----')) {
-                dataStarted = true;
+        // Check if VM directory exists
+        if (!fs.existsSync(vmDir)) {
+            return [];
+        }
+
+        // Read all VM directories
+        const vmDirs = fs.readdirSync(vmDir);
+
+        for (const vmName of vmDirs) {
+            const vmPath = path.join(vmDir, vmName);
+            const infoPath = path.join(vmPath, 'info.json');
+            const pidPath = path.join(vmPath, 'qemu.pid');
+
+            // Skip if not a directory or info.json doesn't exist
+            if (!fs.statSync(vmPath).isDirectory() || !fs.existsSync(infoPath)) {
                 continue;
             }
-            if (!dataStarted || line.startsWith('Total VMs:') || line === 'No VMs found') {
-                continue;
-            }
 
-            // Parse VM line: NAME STATUS ARCH IMAGE HOSTNAME CREDENTIALS
-            const parts = line.split(/\s+/);
-            if (parts.length >= 6) {
-                const name = parts[0];
-                const status = parts[1];
-                const arch = parts[2];
-                const image = parts[3];
-                const hostname = parts[4];
-                const credentials = parts.slice(5).join(' ');
+            try {
+                // Read and parse info.json
+                const infoData = fs.readFileSync(infoPath, 'utf8');
+                const info = JSON.parse(infoData);
 
-                // The hostname in the list is the sanitized version (underscores replaced)
-                // If hostname is '-', use sanitized name + '.local'
-                const sanitizedName = this.sanitizeName(name);
-                const actualHostname = hostname === '-' ? `${sanitizedName}.local` : hostname;
+                const name = info.name || vmName;
+                const arch = info.arch || 'unknown';
+                const image = info.image || 'unknown';
+                const username = info.username || '-';
+                const password = info.password || '-';
+                const netType = info.net_type || 'bridge';
+
+                // Get SSH info
+                let hostname = '-';
+                let sshPort = '22';
+
+                if (info.ssh) {
+                    if (netType === 'bridge') {
+                        // For bridge mode, use mDNS hostname
+                        hostname = `${name}.local`;
+                        sshPort = '22';
+                    } else {
+                        // For port forwarding mode
+                        hostname = info.ssh.host || '127.0.0.1';
+                        sshPort = String(info.ssh.port || '22');
+                    }
+                } else {
+                    hostname = `${name}.local`;
+                }
+
+                // Check if VM is running
+                let isRunning = false;
+                if (fs.existsSync(pidPath)) {
+                    try {
+                        const pidString = fs.readFileSync(pidPath, 'utf8').trim();
+                        if (pidString) {
+                            const pid = parseInt(pidString, 10);
+                            if (!isNaN(pid)) {
+                                // Check if process is alive using ps command. It might fail if the process is gone.
+                                try {
+                                    const { stdout } = await execAsync(`ps -p ${pid}`);
+                                    isRunning = stdout.includes(String(pid));
+                                } catch {
+                                    isRunning = false;
+                                }
+                            }
+                        }
+                    } catch {
+                        isRunning = false;
+                    }
+                }
+
+                // Fallback for bridge mode or stale PID files: check with pgrep
+                if (!isRunning) {
+                    try {
+                        const { stdout } = await execAsync(`pgrep -f "qemu.*-name ${name}"`);
+                        isRunning = stdout.trim().length > 0;
+                    } catch {
+                        isRunning = false;
+                    }
+                }
+
+                const status = isRunning ? 'RUNNING' : 'STOPPED';
+
+                // Get IP address if VM is running
+                let ipAddress = '-';
+                if (isRunning) {
+                    if (netType === 'bridge') {
+                        // For bridge mode, try to resolve mDNS hostname
+                        try {
+                            const { stdout } = await execAsync(`ping -c 1 -t 1 ${hostname} 2>/dev/null | grep -oE '\\([0-9.]+\\)' | tr -d '()'`);
+                            const resolvedIP = stdout.trim();
+                            if (resolvedIP && resolvedIP.match(/^\d+\.\d+\.\d+\.\d+$/)) {
+                                ipAddress = resolvedIP;
+                            }
+                        } catch {
+                            // If ping fails, try using arp to find IP
+                            try {
+                                const { stdout } = await execAsync(`arp -a | grep -i "${hostname}" | grep -oE '\\([0-9.]+\\)' | tr -d '()'`);
+                                const arpIP = stdout.trim();
+                                if (arpIP && arpIP.match(/^\d+\.\d+\.\d+\.\d+$/)) {
+                                    ipAddress = arpIP;
+                                }
+                            } catch {
+                                ipAddress = '-';
+                            }
+                        }
+                    } else {
+                        // For port forwarding mode, use localhost
+                        ipAddress = '127.0.0.1';
+                    }
+                }
 
                 vms.push({
                     name,
                     status,
-                    arch: arch === '-' ? 'unknown' : arch,
-                    image: image === '-' ? 'unknown' : image,
-                    hostname: actualHostname,
-                    credentials: credentials === '-' ? 'unknown' : credentials,
-                    uptime: status === 'RUNNING' ? 'Active' : undefined
+                    arch,
+                    image,
+                    hostname,
+                    ipAddress,
+                    username,
+                    password,
+                    sshPort,
+                    uptime: isRunning ? 'Active' : undefined
                 });
+            } catch (error) {
+                console.error(`Failed to parse VM info for ${vmName}:`, error);
+                continue;
             }
         }
 
-        return vms;
+        // Sort by name
+        return vms.sort((a, b) => a.name.localeCompare(b.name));
     }
 
     async createVm(options: VmCreateOptions = {}): Promise<void> {

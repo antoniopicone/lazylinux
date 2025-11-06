@@ -39,21 +39,21 @@ export class VmTreeProvider implements vscode.TreeDataProvider<VmTreeItem | VmDe
 
     private getVmDetails(vm: VmInfo): VmDetailTreeItem[] {
         const hostname = vm.hostname === '-' ? vm.name + '.local' : vm.hostname;
-        const credentials = vm.credentials === '-' ? 'unknown' : vm.credentials;
+        const username = vm.username || 'unknown';
+        const password = vm.password || 'unknown';
+        const ipAddress = vm.ipAddress || '-';
 
         const details: VmDetailItem[] = [
             { label: 'Status', value: vm.status },
-            { label: 'Hostname', value: hostname }
+            { label: 'IP Address', value: ipAddress },
+            { label: 'Hostname', value: hostname },
+            { label: 'Username', value: username },
+            { label: 'Password', value: this.hidePassword(password) }
         ];
 
-        // Add username and password as separate fields
-        if (credentials !== 'unknown') {
-            const { username, password } = this.parseCredentials(credentials);
-            details.push({ label: 'Username', value: username });
-            details.push({ label: 'Password', value: this.hidePassword(password) });
-        } else {
-            details.push({ label: 'Username', value: 'unknown' });
-            details.push({ label: 'Password', value: 'unknown' });
+        // Add SSH port if not standard port 22
+        if (vm.sshPort && vm.sshPort !== '22') {
+            details.push({ label: 'SSH Port', value: vm.sshPort });
         }
 
         // if (vm.uptime) {
@@ -61,32 +61,16 @@ export class VmTreeProvider implements vscode.TreeDataProvider<VmTreeItem | VmDe
         // }
 
         return details.map(detail => {
-            const copyable = detail.label === 'Hostname' || detail.label === 'Username' || detail.label === 'Password';
+            const copyable = detail.label === 'IP Address' || detail.label === 'Hostname' || detail.label === 'Username' || detail.label === 'Password';
             let actualValue = detail.value;
 
             // For password, use the actual password value for copying, not the hidden version
-            if (detail.label === 'Password' && credentials !== 'unknown') {
-                const { password } = this.parseCredentials(credentials);
+            if (detail.label === 'Password') {
                 actualValue = password;
             }
 
             return new VmDetailTreeItem(detail.label, detail.value, copyable, actualValue);
         });
-    }
-
-    private parseCredentials(credentials: string): { username: string; password: string } {
-        if (credentials === 'unknown') {
-            return { username: 'unknown', password: 'unknown' };
-        }
-
-        // Parse "username / password" format
-        const parts = credentials.split(' / ');
-        if (parts.length === 2) {
-            return { username: parts[0], password: parts[1] };
-        }
-
-        // Fallback if format is different
-        return { username: credentials, password: 'unknown' };
     }
 
     private hidePassword(password: string): string {
@@ -113,8 +97,16 @@ class VmTreeItem extends vscode.TreeItem {
         return this.vm.hostname;
     }
 
-    get credentials(): string {
-        return this.vm.credentials;
+    get ipAddress(): string {
+        return this.vm.ipAddress;
+    }
+
+    get username(): string {
+        return this.vm.username;
+    }
+
+    get password(): string {
+        return this.vm.password;
     }
 
     private getDescription(): string {

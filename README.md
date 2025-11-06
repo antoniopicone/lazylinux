@@ -58,6 +58,9 @@ vm create --name myvm --memory 4G --cpus 4 --disk 20G
 
 # Create an x86_64 (amd64) VM (emulated on Apple Silicon)
 vm create --name myvm-amd64 --arch amd64
+
+# Create multiple VMs at once with comma-separated names
+vm create --name vm1,vm2,vm3 --user admin --pass test
 ```
 
 **Note**: VM names with underscores will be automatically converted to hyphens for DNS compliance (e.g., `my_vm` → `my-vm`). You'll be prompted to confirm the conversion.
@@ -123,14 +126,15 @@ vm delete VM_NAME
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--name NAME` | VM name (optional) | auto-generated |
+| `--name NAME` | VM name (optional). Use comma-separated names to create multiple VMs: `vm1,vm2,vm3` | auto-generated |
 | `--arch ARCH` | Architecture (`arm64`, `amd64`) | arm64 |
 | `--user USERNAME` | Username | user01 |
 | `--pass PASSWORD` | Password | auto-generated |
 | `--memory SIZE` | Memory size | 2G |
 | `--cpus COUNT` | CPU count | 2 |
 | `--disk SIZE` | Disk size | 10G |
-| `--ssh-port PORT` | SSH port | auto-assign |
+| `--ssh-port PORT` | SSH port (auto-assigned when creating multiple VMs) | auto-assign |
+| `--ip IP_ADDRESS` | Static IP address for bridge mode (auto-generated when creating multiple VMs) | auto-generated |
 | `--net-type TYPE` | Network type (`bridge`, `portfwd`) | bridge |
 | `--show-console` | Show console output | false |
 
@@ -183,6 +187,31 @@ vm create --name dev-amd64 --arch amd64
 ```
 
 **Note**: If you use underscores in VM names (e.g., `k3s_node1`), the script will suggest converting them to hyphens (`k3s-node1`) for RFC-compliant hostnames. You'll be prompted to accept or cancel.
+
+### Creating Multiple VMs
+
+Create multiple VMs with the same configuration in one command by separating names with commas:
+
+```bash
+# Create 3 VMs with shared configuration
+vm create --name vm1,vm2,vm3 --user admin --pass test
+
+# Create multiple VMs with specific architecture and resources
+vm create --name server1,server2,server3 --arch amd64 --memory 4G --cpus 4
+
+# Create a cluster of VMs for development
+vm create --name dev1,dev2,dev3 --user developer --memory 2G
+
+# Spaces around commas are automatically trimmed
+vm create --name web1, web2, web3 --user www
+```
+
+**Key Features:**
+- Each VM is created iteratively with progress tracking (`[1/3]`, `[2/3]`, `[3/3]`)
+- All VMs share the same configuration (user, password, architecture, memory, etc.)
+- SSH ports and IP addresses are automatically assigned to each VM to avoid conflicts
+- If one VM fails to create, the process continues with the remaining VMs
+- Static IP addresses are deterministically generated based on each VM's name
 
 ### Working with VMs
 

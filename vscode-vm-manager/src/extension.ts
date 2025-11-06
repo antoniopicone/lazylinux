@@ -258,15 +258,23 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('vmManager.sshVm', async (vm) => {
             try {
                 const terminal = vscode.window.createTerminal(`SSH: ${vm.name}`);
-                // Parse credentials to get username
-                let username = 'user'; // default fallback
-                if (vm.credentials !== '-' && vm.credentials !== 'unknown') {
-                    const parts = vm.credentials.split(' / ');
-                    if (parts.length >= 1) {
-                        username = parts[0];
-                    }
+
+                // Get username from VM properties
+                const username = vm.username || vm.vm?.username || 'user01';
+
+                // Use IP address if available, otherwise fallback to hostname
+                const sshTarget = vm.ipAddress && vm.ipAddress !== '-' ? vm.ipAddress : vm.hostname;
+
+                // Get SSH port from VM properties
+                const sshPort = vm.vm?.sshPort || '22';
+
+                // Build SSH command with port if needed
+                let sshCommand = `ssh ${username}@${sshTarget}`;
+                if (sshPort !== '22') {
+                    sshCommand += ` -p ${sshPort}`;
                 }
-                terminal.sendText(`ssh ${username}@${vm.hostname}`);
+
+                terminal.sendText(sshCommand);
                 terminal.show();
             } catch (error) {
                 vscode.window.showErrorMessage(`Failed to SSH to VM: ${error}`);

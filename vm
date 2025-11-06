@@ -61,6 +61,70 @@ sanitize_hostname() {
     echo "${name//_/-}"
 }
 
+# Generate static IP from VM name (deterministic)
+# Uses hash of VM name to generate last octet in range 100-254
+generate_static_ip() {
+    local vm_name="$1"
+    # Use checksum to generate a number from the VM name
+    local hash=$(echo -n "$vm_name" | cksum | cut -d' ' -f1)
+    # Map to range 100-254 (155 possible values)
+    local last_octet=$((100 + (hash % 155)))
+    echo "192.168.105.$last_octet"
+}
+
+# Get next available static IP by checking existing VMs
+get_next_available_ip() {
+    local base_ip="192.168.105"
+    local used_ips=()
+
+    # Collect all IPs currently in use
+    if [[ -d "$VMS_DIR" ]]; then
+        for vm_dir in "$VMS_DIR"/*; do
+            if [[ -f "$vm_dir/info.json" ]]; then
+                local ip=$(grep -o '"static_ip": "[^"]*"' "$vm_dir/info.json" 2>/dev/null | cut -d'"' -f4)
+                if [[ -n "$ip" ]]; then
+                    used_ips+=("$ip")
+                fi
+            fi
+        done
+    fi
+
+    # Find first available IP in range 100-254
+    for i in {100..254}; do
+        local candidate="$base_ip.$i"
+        local found=false
+        for used in "${used_ips[@]}"; do
+            if [[ "$used" == "$candidate" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+
+    # Fallback if all IPs are used (unlikely)
+    echo "$base_ip.100"
+}
+
+# Validate IP address format
+validate_ip() {
+    local ip="$1"
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        local -a octets=($ip)
+        for octet in "${octets[@]}"; do
+            if [[ $octet -gt 255 ]] 2>/dev/null; then
+                return 1
+            fi
+        done
+        return 0
+    fi
+    return 1
+}
+
 # Progress indicator functions
 show_progress() {
     local message="$1"
@@ -234,6 +298,10 @@ extract_vm_ip_from_log() {
     local console_log="$1"
     local max_wait="${2:-60}"  # Wait up to 60 seconds by default
     local elapsed=0
+    local step=0
+
+    # Spinner frames for animation
+    local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 
     while [[ $elapsed -lt $max_wait ]]; do
         if [[ -f "$console_log" ]]; then
@@ -257,7 +325,14 @@ extract_vm_ip_from_log() {
             fi
         fi
 
-        sleep 2
+        # Update spinner animation (iterate every 0.2s for smooth animation)
+        for i in {1..10}; do
+            local frame_index=$((step % ${#frames[@]}))
+            echo -ne "\r${DARK_YELLOW}${frames[$frame_index]}${NC} VM booted, waiting for network DHCP to assign IP..."
+            sleep 0.2
+            ((step++))
+        done
+
         elapsed=$((elapsed + 2))
     done
 
@@ -447,10 +522,13 @@ EOF
         echo "Configuring sudo to allow passwordless execution of socket_vmnet_client..."
         echo
         echo -e "${YELLOW}INFO:${NC} This will allow your user to run socket_vmnet_client without password."
-        echo "This is safe as it only affects this specific command."
+        echo "This is safe as it only affects specific commands for VM management."
         echo
-        echo "The following line will be added to $sudoers_file:"
+        echo "The following lines will be added to $sudoers_file:"
         echo "  $USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT"
+        echo "  $USER ALL=(ALL) NOPASSWD: /bin/chmod 666 $HOME/.vm/vms/*/monitor.sock"
+        echo
+        echo "Note: The chmod permission is needed to fix monitor socket permissions after VM creation."
         echo
         read -p "Continue? (Y/n): " confirm
 
@@ -462,7 +540,13 @@ EOF
             return 1
         fi
 
-        if echo "$USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT" | sudo tee "$sudoers_file" > /dev/null; then
+        # Allow both socket_vmnet_client and chmod for monitor sockets
+        cat <<EOF | sudo tee "$sudoers_file" > /dev/null
+$USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT
+$USER ALL=(ALL) NOPASSWD: /bin/chmod 666 $HOME/.vm/vms/*/monitor.sock
+EOF
+
+        if [[ -f "$sudoers_file" ]]; then
             # Set correct permissions on sudoers file
             sudo chmod 0440 "$sudoers_file"
 
@@ -627,7 +711,7 @@ cleanup_vm_on_interrupt() {
         
         # Stop QEMU process if running
         if [[ -f "$pid_file" ]]; then
-            local pid=$(cat "$pid_file" 2>/dev/null)
+            local pid=$(cat "$pid_file" 2>/dev/null || true)
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 echo "Stopping QEMU process..."
                 kill -TERM "$pid" 2>/dev/null || true
@@ -684,16 +768,48 @@ create_cloud_init() {
     local password="$3"
     local hostname="$4"
     local net_type="$5"
+    local static_ip="$6"
 
     # Sanitize hostname: replace underscores with hyphens (RFC 952/1123 compliant)
     hostname="${hostname//_/-}"
 
     # Create temporary directory for cloud-init files
     local tmpdir=$(mktemp -d)
-    
+
     # Create user-data content with proper indentation
     local user_data=""
     if [[ "$net_type" == "bridge" ]]; then
+        # Determine network configuration based on static IP
+        local netplan_config=""
+        if [[ -n "$static_ip" ]]; then
+            # Static IP configuration
+            netplan_config="      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          enp0s1:
+            addresses:
+              - ${static_ip}/24
+            routes:
+              - to: default
+                via: 192.168.105.1
+            nameservers:
+              addresses: [8.8.8.8, 1.1.1.1]
+            dhcp4: no
+            dhcp6: no"
+        else
+            # DHCP configuration (fallback)
+            netplan_config="      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          enp0s1:
+            dhcp4: yes
+            dhcp6: no
+            nameservers:
+              addresses: [8.8.8.8, 1.1.1.1]"
+        fi
+
         user_data=$(cat <<EOF
 #cloud-config
 datasource_list: [ NoCloud, None ]
@@ -718,15 +834,7 @@ write_files:
       network: {config: disabled}
   - path: /etc/netplan/01-netcfg.yaml
     content: |
-      network:
-        version: 2
-        renderer: networkd
-        ethernets:
-          enp0s1:
-            dhcp4: yes
-            dhcp6: no
-            nameservers:
-              addresses: [8.8.8.8, 1.1.1.1]
+$netplan_config
   - path: /usr/local/bin/report-ip.sh
     permissions: '0755'
     content: |
@@ -1120,6 +1228,7 @@ Commands:
 
 Create options:
     --name NAME         VM name (optional - auto-generated if not provided)
+                        Multiple VMs: Use comma-separated names (e.g., vm1,vm2,vm3)
                         Note: Underscores will be converted to hyphens for hostname compliance
     --arch ARCH         Architecture (default: arm64, options: arm64, amd64)
     --user USERNAME     Username (default: $DEFAULT_USERNAME)
@@ -1129,13 +1238,17 @@ Create options:
     --disk SIZE         Disk size (default: $DEFAULT_DISK)
     --ssh-port PORT     SSH port (default: auto-assign)
     --net-type TYPE     Network type (default: bridge, options: bridge, portfwd)
+    --ip IP_ADDRESS     Static IP address for bridge mode (optional - auto-generated if not provided)
+                        Auto-generated IPs are deterministic based on VM name (range: 192.168.105.100-254)
     --show-console      Show console output
     --debug             Show debug information including QEMU command
 
 Examples:
     $0 install                          # Install + setup bridge networking (one-time)
-    $0 create                           # Create VM with auto-generated name
-    $0 create --name myvm
+    $0 create                           # Create VM with auto-generated name and IP
+    $0 create --name myvm               # Create VM with deterministic auto-generated IP
+    $0 create --name myvm --ip 192.168.105.150  # Create VM with specific static IP
+    $0 create --name vm1,vm2,vm3 --user admin --pass test  # Create 3 VMs with same config
     $0 create --arch amd64 --memory 4G
     $0 list
     $0 start myvm
@@ -1159,12 +1272,13 @@ vm_create() {
     local disk="$DEFAULT_DISK"
     local ssh_port=""
     local net_type="bridge"
+    local static_ip=""
     local show_console=false
     local debug=false
-    
+
     # Set up interrupt handling
     trap cleanup_vm_on_interrupt SIGINT
-    
+
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -1207,6 +1321,13 @@ vm_create() {
                 fi
                 shift 2
                 ;;
+            --ip)
+                static_ip="$2"
+                if ! validate_ip "$static_ip"; then
+                    error "Invalid IP address format: $static_ip"
+                fi
+                shift 2
+                ;;
             --show-console)
                 show_console=true
                 shift
@@ -1220,10 +1341,66 @@ vm_create() {
                 ;;
         esac
     done
-    
+
     # Generate random name if not provided
     if [[ -z "$name" ]]; then
         name=$(generate_random_vm_name)
+    fi
+
+    # Check if name contains comma (multiple VMs to create)
+    if [[ "$name" == *","* ]]; then
+        # Split names by comma and create each VM iteratively
+        IFS=',' read -ra vm_names <<< "$name"
+        local total_vms=${#vm_names[@]}
+        local current_vm=0
+
+        echo "Creating $total_vms VMs with shared configuration..."
+
+        # Warn if user specified ssh-port or static IP (will be ignored for multi-VM)
+        if [[ -n "$ssh_port" ]]; then
+            echo -e "${YELLOW}[!]${NC} --ssh-port will be auto-assigned for each VM (specified port ignored for multi-VM creation)"
+        fi
+        if [[ -n "$static_ip" ]]; then
+            echo -e "${YELLOW}[!]${NC} --ip will be auto-generated for each VM (specified IP ignored for multi-VM creation)"
+        fi
+        echo
+
+        for vm_name in "${vm_names[@]}"; do
+            # Trim whitespace
+            vm_name=$(echo "$vm_name" | xargs)
+            ((current_vm++))
+
+            echo -e "${BLUE}[${current_vm}/${total_vms}]${NC} Creating VM: $vm_name"
+
+            # Build arguments for recursive call
+            local create_args=(
+                "--name" "$vm_name"
+                "--arch" "$arch"
+                "--user" "$username"
+                "--memory" "$memory"
+                "--cpus" "$cpus"
+                "--disk" "$disk"
+                "--net-type" "$net_type"
+            )
+
+            # Add optional parameters if specified
+            # Note: ssh_port and static_ip are intentionally NOT passed to allow auto-generation
+            [[ -n "$password" ]] && create_args+=("--pass" "$password")
+            [[ "$show_console" == true ]] && create_args+=("--show-console")
+            [[ "$debug" == true ]] && create_args+=("--debug")
+
+            # Recursively call vm_create for each VM
+            if ! vm_create "${create_args[@]}"; then
+                echo -e "${RED}✗${NC} Failed to create VM: $vm_name"
+                echo
+                continue
+            fi
+
+            echo
+        done
+
+        echo -e "${GREEN}✔${NC} Completed creating $total_vms VMs"
+        return 0
     fi
 
     # Check if VM name contains underscores (not RFC 952/1123 compliant)
@@ -1260,6 +1437,23 @@ vm_create() {
     [[ -z "$password" ]] && password=$(generate_password 16)
     [[ -z "$ssh_port" ]] && ssh_port=$(find_free_port)
 
+    # Generate static IP for bridge mode if not specified
+    if [[ "$net_type" == "bridge" && -z "$static_ip" ]]; then
+        static_ip=$(generate_static_ip "$name")
+        # Check if IP is already in use, if so get next available
+        if [[ -d "$VMS_DIR" ]]; then
+            for existing_vm_dir in "$VMS_DIR"/*; do
+                if [[ -f "$existing_vm_dir/info.json" ]]; then
+                    local existing_ip=$(grep -o '"static_ip": "[^"]*"' "$existing_vm_dir/info.json" 2>/dev/null | cut -d'"' -f4)
+                    if [[ "$existing_ip" == "$static_ip" ]]; then
+                        static_ip=$(get_next_available_ip)
+                        break
+                    fi
+                fi
+            done
+        fi
+    fi
+
     local vm_dir="$VMS_DIR/$name"
     
     # Set global variables for cleanup
@@ -1273,7 +1467,7 @@ vm_create() {
             log "VM '$name' already exists. Checking if it's running..."
             local pid_file="$vm_dir/qemu.pid"
             if [[ -f "$pid_file" ]]; then
-                local pid=$(cat "$pid_file" 2>/dev/null)
+                local pid=$(cat "$pid_file" 2>/dev/null || true)
                 if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                     local existing_port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
                     local existing_user=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
@@ -1335,7 +1529,7 @@ vm_create() {
     # Create cloud-init seed (suppress output)
     # Note: VM name is already sanitized at the beginning of vm_create
     local seed_iso
-    if ! seed_iso=$(create_cloud_init "$vm_dir" "$username" "$password" "$name" "$net_type" 2>/dev/null); then
+    if ! seed_iso=$(create_cloud_init "$vm_dir" "$username" "$password" "$name" "$net_type" "$static_ip" 2>/dev/null); then
         show_error "Failed to create cloud-init configuration"
         return 1
     fi
@@ -1357,8 +1551,9 @@ vm_create() {
   "username": "$username",
   "password": "$password",
   "net_type": "$net_type",
+  "static_ip": "$static_ip",
   "ssh": {
-    "host": "dhcp-assigned",
+    "host": "$static_ip",
     "port": 22
   }
 }
@@ -1447,11 +1642,14 @@ EOF
     else
         local console_log="$vm_dir/console.log"
         local pid_file="$vm_dir/qemu.pid"
+        # Setup QEMU monitor socket for graceful shutdown
+        local monitor_socket="$vm_dir/monitor.sock"
+
         qemu_args+=(
             "-daemonize"
             "-display" "none"
             "-serial" "file:$console_log"
-            "-monitor" "none"
+            "-monitor" "unix:$monitor_socket,server,nowait"
         )
 
         # Only add pidfile for non-bridge mode (bridge mode runs as root, can't write to user dir)
@@ -1467,10 +1665,18 @@ EOF
             local qemu_success=false
             
             if [[ "$net_type" == "bridge" ]]; then
+                # Start QEMU - monitor socket permissions will be fixed after creation
                 if sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}" >/dev/null 2>&1; then
                     qemu_success=true
                     # Note: QEMU will create the PID file automatically (as root)
                     # Our commands use fallback with pgrep if PID file can't be read
+
+                    # Fix monitor socket permissions so user can access it without sudo
+                    # Wait a moment for socket to be created
+                    sleep 1
+                    if [[ -S "$monitor_socket" ]]; then
+                        sudo chmod 666 "$monitor_socket" 2>/dev/null || true
+                    fi
                     break
                 fi
             else
@@ -1533,7 +1739,6 @@ EOF
             # Extract IP address from console log for bridge mode VMs
             if [[ "$net_type" == "bridge" ]]; then
                 echo -ne "\r\033[K"  # Clear the progress line
-                echo -ne "${DARK_YELLOW}⠋${NC} VM booted, waiting for network DHCP to assign IP..."
 
                 local detected_ip=$(extract_vm_ip_from_log "$console_log" 90)
                 if [[ -n "$detected_ip" ]]; then
@@ -1598,7 +1803,7 @@ vm_list() {
         # Check if VM is running
         local is_running=false
         if [[ -f "$pid_file" ]]; then
-            local pid=$(cat "$pid_file" 2>/dev/null)
+            local pid=$(cat "$pid_file" 2>/dev/null || true)
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 is_running=true
             else
@@ -1655,9 +1860,9 @@ vm_start() {
     local name="$1"
     local show_console=false
     local debug=false
-    
+
     [[ -z "$name" ]] && error "VM name is required"
-    
+
     # Parse remaining arguments
     shift
     while [[ $# -gt 0 ]]; do
@@ -1675,19 +1880,19 @@ vm_start() {
                 ;;
         esac
     done
-    
+
     local vm_dir="$VMS_DIR/$name"
     local info_file="$vm_dir/info.json"
     local pid_file="$vm_dir/qemu.pid"
-    
+
     # Check if VM exists
     if [[ ! -d "$vm_dir" ]] || [[ ! -f "$info_file" ]]; then
         error "VM '$name' does not exist"
     fi
-    
+
     # Check if already running
     if [[ -f "$pid_file" ]]; then
-        local pid=$(cat "$pid_file" 2>/dev/null)
+        local pid=$(cat "$pid_file" 2>/dev/null || true)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
             local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
@@ -1697,7 +1902,7 @@ vm_start() {
         # Clean up stale PID file
         rm -f "$pid_file"
     fi
-    
+
     log "Starting VM: $name"
 
     # Extract VM info
@@ -1830,27 +2035,39 @@ vm_start() {
         fi
     else
         local console_log="$vm_dir/console.log"
+        # Setup QEMU monitor socket for graceful shutdown
+        local monitor_socket="$vm_dir/monitor.sock"
+
         qemu_args+=(
             "-daemonize"
             "-display" "none"
             "-serial" "file:$console_log"
-            "-monitor" "none"
+            "-monitor" "unix:$monitor_socket,server,nowait"
             "-pidfile" "$pid_file"
         )
         
         if [[ "$net_type" == "bridge" ]]; then
+            # For bridge mode, we need sudo. The command will run in the background.
             bridge_success=0
-            if sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}" 2>/dev/null; then
-                bridge_success=0
+            # Start QEMU - monitor socket permissions will be fixed after creation
+            if sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}"; then
                 # Note: QEMU will create the PID file automatically (as root)
+                # We need to wait a moment and then set correct permissions to read it.
                 # Our commands use fallback with pgrep if PID file can't be read
+
+                # Fix monitor socket permissions so user can access it without sudo
+                sleep 1
+                if [[ -S "$monitor_socket" ]]; then
+                    sudo chmod 666 "$monitor_socket" 2>/dev/null || true
+                fi
+                bridge_success=0
             else
                 bridge_success=1
             fi
         else
             bridge_success=0
             if "${qemu_args[@]}" 2>/dev/null; then
-                bridge_success=0
+                : # Success
             else
                 bridge_success=1
             fi
@@ -1880,12 +2097,33 @@ vm_start() {
                     return 1
                 fi
             else
-                # VM already initialized
+                # VM already initialized - wait for network and detect IP
                 if [[ "$net_type" == "bridge" ]]; then
-                    echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
+                    echo -ne "${DARK_YELLOW}⠋${NC} VM started, waiting for network..."
+
+                    # Wait a moment for VM to boot
+                    sleep 3
+
+                    # Try to detect IP from console log
+                    local detected_ip=$(extract_vm_ip_from_log "$console_log" 30)
+
+                    echo -ne "\r\033[K"  # Clear the waiting message
+
+                    if [[ -n "$detected_ip" ]]; then
+                        # Update info.json with the detected IP
+                        update_vm_ip_in_info "$info_file" "$detected_ip"
+                        echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
+                        echo "IP Address: $detected_ip"
+                    else
+                        # Fallback to saved IP or hostname
+                        local saved_ip=$(grep -o '"host": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                        echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
+                        if [[ -n "$saved_ip" && "$saved_ip" != "127.0.0.1" ]]; then
+                            echo "IP Address: $saved_ip"
+                        fi
+                    fi
                 else
-                    echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
-                    echo "(Alternative: ssh $username@127.0.0.1 -p $ssh_port)"
+                    echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@127.0.0.1 -p ${ssh_port} using password: ${password}"
                 fi
             fi
         else
@@ -1897,53 +2135,122 @@ vm_start() {
 
 vm_stop() {
     local name="$1"
-    
+
     [[ -z "$name" ]] && error "VM name is required"
-    
+
+    log "Stopping VM: $name"
     local vm_dir="$VMS_DIR/$name"
     local pid_file="$vm_dir/qemu.pid"
-    
+
     if [[ ! -d "$vm_dir" ]]; then
         error "VM '$name' does not exist"
     fi
-    
+
     local pid=""
+    local is_root_process=false
+
+    # Try to find PID from pidfile first
     if [[ -f "$pid_file" ]]; then
-        pid=$(cat "$pid_file" 2>/dev/null)
-        if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-            log "VM '$name' is not running (cleaning up stale PID file)"
-            rm -f "$pid_file"
-            pid=""
+        pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [[ -n "$pid" ]]; then
+            # Check if process is running
+            if ! ps -p "$pid" > /dev/null 2>&1; then
+                log "VM '$name' is not running (cleaning up stale PID file)"
+                rm -f "$pid_file"
+                pid=""
+            else
+                # Check if process is owned by root
+                if [[ $(ps -o user= -p "$pid") == "root" ]]; then
+                    is_root_process=true
+                fi
+            fi
         fi
     fi
-    
+
+    # If pidfile didn't work, try pgrep
     if [[ -z "$pid" ]]; then
         pid=$(pgrep -f "qemu.*-name $name" | head -1)
         if [[ -z "$pid" ]]; then
             log "VM '$name' is not running"
             return
         fi
+        # Check if this process is owned by root
+        if [[ $(ps -o user= -p "$pid") == "root" ]]; then
+            is_root_process=true
+        fi
     fi
-    
-    log "Stopping VM: $name (PID: $pid)"
-    
-    if kill -TERM "$pid" 2>/dev/null; then
+
+    log "Found VM process with PID: $pid. Sending shutdown signal..."
+
+    # Try graceful ACPI shutdown via QEMU monitor if available
+    # This works without sudo even for root processes
+    local monitor_socket="$vm_dir/monitor.sock"
+    local shutdown_success=false
+
+    if [[ -S "$monitor_socket" ]]; then
+        log "Attempting graceful ACPI shutdown via QEMU monitor..."
+
+        # Check if socket is accessible, if not try to fix permissions
+        if ! [[ -r "$monitor_socket" && -w "$monitor_socket" ]]; then
+            # Socket exists but we can't access it - try to fix permissions
+            if sudo -n chmod 666 "$monitor_socket" 2>/dev/null; then
+                : # Successfully fixed permissions without password prompt
+            else
+                # Need password for sudo - inform user
+                echo "Note: Fixing monitor socket permissions (one-time for this VM)..."
+                sudo chmod 666 "$monitor_socket" 2>/dev/null || true
+            fi
+        fi
+
+        # Try using socat if available, otherwise use nc (netcat)
+        if command -v socat >/dev/null 2>&1; then
+            if echo "system_powerdown" | socat - UNIX-CONNECT:"$monitor_socket" >/dev/null 2>&1; then
+                shutdown_success=true
+                log "ACPI shutdown signal sent successfully"
+            fi
+        elif command -v nc >/dev/null 2>&1; then
+            if echo "system_powerdown" | nc -U "$monitor_socket" >/dev/null 2>&1; then
+                shutdown_success=true
+                log "ACPI shutdown signal sent successfully"
+            fi
+        fi
+    fi
+
+    # Fallback to kill signal if monitor not available
+    if [[ "$shutdown_success" == false ]]; then
+        log "QEMU monitor not available, using kill signal..."
+        if [[ "$is_root_process" == true ]]; then
+            if sudo kill -TERM "$pid" >/dev/null 2>&1; then
+                shutdown_success=true
+            fi
+        else
+            if kill -TERM "$pid" >/dev/null 2>&1; then
+                shutdown_success=true
+            fi
+        fi
+    fi
+
+    if [[ "$shutdown_success" == true ]]; then
         local count=0
         local timeout=30
-        
-        log "Sending graceful shutdown signal..."
-        while [[ $count -lt $timeout ]] && kill -0 "$pid" 2>/dev/null; do
+
+        log "Waiting for VM to shut down..."
+        while [[ $count -lt $timeout ]] && ps -p "$pid" > /dev/null 2>&1; do
             sleep 1
             ((count++))
         done
-        
-        if kill -0 "$pid" 2>/dev/null; then
+
+        if ps -p "$pid" > /dev/null 2>&1; then
             log "Graceful shutdown timed out, forcing stop..."
-            kill -KILL "$pid" 2>/dev/null
+            if [[ "$is_root_process" == true ]]; then
+                sudo kill -KILL "$pid" 2>/dev/null
+            else
+                kill -KILL "$pid" 2>/dev/null
+            fi
             sleep 2
         fi
-        
-        if ! kill -0 "$pid" 2>/dev/null; then
+
+        if ! ps -p "$pid" > /dev/null 2>&1; then
             log "VM stopped successfully"
             rm -f "$pid_file"
         else
@@ -1975,7 +2282,7 @@ vm_ip() {
     local pid_file="$vm_dir/qemu.pid"
     local pid=""
     if [[ -f "$pid_file" ]]; then
-        pid=$(cat "$pid_file" 2>/dev/null)
+        pid=$(cat "$pid_file" 2>/dev/null || true)
     fi
 
     # Fallback: search for process by name if PID file doesn't exist or is invalid
@@ -2034,7 +2341,7 @@ vm_ssh() {
     [[ ! -d "$vm_dir" || ! -f "$info_file" ]] && error "VM '$name' does not exist"
     
     local pid_file="$vm_dir/qemu.pid"
-    if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+    if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file" 2>/dev/null || true)" 2>/dev/null; then
         error "VM '$name' is not running"
     fi
     
@@ -2082,7 +2389,7 @@ vm_delete() {
     
     local pid_file="$vm_dir/qemu.pid"
     if [[ -f "$pid_file" ]]; then
-        local pid=$(cat "$pid_file" 2>/dev/null)
+        local pid=$(cat "$pid_file" 2>/dev/null || true)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             log "Stopping running VM before deletion..."
             vm_stop "$name"
@@ -2144,7 +2451,7 @@ purge() {
         local pid_file="$vm_dir/qemu.pid"
         
         if [[ -f "$pid_file" ]]; then
-            local pid=$(cat "$pid_file" 2>/dev/null)
+            local pid=$(cat "$pid_file" 2>/dev/null || true)
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 kill -TERM "$pid" 2>/dev/null
                 sleep 2
@@ -2240,6 +2547,7 @@ USAGE: $0 COMMAND [options]
 
 COMMANDS:
     install             Install vm command + setup bridge networking
+    setup-bridge        Setup or reconfigure bridge networking (including sudo permissions)
     create              Create and start a new VM
     list                List all VMs and their status
     start VM_NAME       Start an existing VM
@@ -2319,6 +2627,7 @@ main() {
         ssh) shift; vm_ssh "$@" ;;
         purge) shift; purge "$@" ;;
         diagnose) diagnose_network ;;
+        setup-bridge) shift; setup_bridge_networking "$@" ;;
         install) shift; install_command "$@" ;;
         uninstall) shift; uninstall_command "$@" ;;
         help|--help|-h|"") vm_help ;;
