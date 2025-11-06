@@ -825,6 +825,7 @@ package_update: false
 packages:
   - openssh-server
   - avahi-daemon
+  - locales-all
 output:
   all: '| tee -a /var/log/cloud-init-output.log'
 write_files:
