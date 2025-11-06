@@ -7,7 +7,7 @@ WORK_ROOT="$HOME/.vm"
 IMAGES_DIR="$WORK_ROOT/images"
 VMS_DIR="$WORK_ROOT/vms"
 DEFAULT_USERNAME="user01"
-DEFAULT_MEMORY="2G"
+DEFAULT_MEMORY="4G"
 DEFAULT_CPUS="2"
 DEFAULT_DISK="10G"
 DEFAULT_IMAGE="debian13"
@@ -310,6 +310,7 @@ extract_vm_ip_from_log() {
             local ip=$(grep "ci-info.*enp0s1.*True" "$console_log" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
 
             if [[ -n "$ip" && "$ip" != "0.0.0.0" ]]; then
+                echo -ne "\r\033[K" >&2  # Clear spinner before returning (to stderr)
                 echo "$ip"
                 return 0
             fi
@@ -319,6 +320,7 @@ extract_vm_ip_from_log() {
                 # Cloud-init finished, try one more time
                 ip=$(grep "ci-info.*enp0s1.*True" "$console_log" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
                 if [[ -n "$ip" && "$ip" != "0.0.0.0" ]]; then
+                    echo -ne "\r\033[K" >&2  # Clear spinner before returning (to stderr)
                     echo "$ip"
                     return 0
                 fi
@@ -326,9 +328,10 @@ extract_vm_ip_from_log() {
         fi
 
         # Update spinner animation (iterate every 0.2s for smooth animation)
+        # Output to stderr so it doesn't get captured by command substitution
         for i in {1..10}; do
             local frame_index=$((step % ${#frames[@]}))
-            echo -ne "\r${DARK_YELLOW}${frames[$frame_index]}${NC} VM booted, waiting for network DHCP to assign IP..."
+            echo -ne "\r${DARK_YELLOW}${frames[$frame_index]}${NC} VM booted, waiting for network DHCP to assign IP..." >&2
             sleep 0.2
             ((step++))
         done
@@ -336,6 +339,7 @@ extract_vm_ip_from_log() {
         elapsed=$((elapsed + 2))
     done
 
+    echo -ne "\r\033[K" >&2  # Clear spinner before returning on timeout (to stderr)
     return 1
 }
 
@@ -1887,7 +1891,9 @@ vm_start() {
 
     # Check if VM exists
     if [[ ! -d "$vm_dir" ]] || [[ ! -f "$info_file" ]]; then
-        error "VM '$name' does not exist"
+        echo -e "${RED}✖${NC} VM '$name' does not exist"
+        echo -e "Create it with: ${GREEN}./vm create --name $name${NC}"
+        exit 1
     fi
 
     # Check if already running
@@ -2099,28 +2105,29 @@ vm_start() {
             else
                 # VM already initialized - wait for network and detect IP
                 if [[ "$net_type" == "bridge" ]]; then
-                    echo -ne "${DARK_YELLOW}⠋${NC} VM started, waiting for network..."
+                    # First, try to get the saved IP from info.json
+                    local saved_ip=$(grep -o '"host": "[^"]*"' "$info_file" | cut -d'"' -f4)
 
                     # Wait a moment for VM to boot
                     sleep 3
 
-                    # Try to detect IP from console log
-                    local detected_ip=$(extract_vm_ip_from_log "$console_log" 30)
+                    # Try to detect fresh IP from console log (with reduced timeout since VM is already configured)
+                    local detected_ip=$(extract_vm_ip_from_log "$console_log" 15)
 
-                    echo -ne "\r\033[K"  # Clear the waiting message
-
+                    # Now print everything together after detection completes
                     if [[ -n "$detected_ip" ]]; then
                         # Update info.json with the detected IP
                         update_vm_ip_in_info "$info_file" "$detected_ip"
                         echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
                         echo "IP Address: $detected_ip"
-                    else
-                        # Fallback to saved IP or hostname
-                        local saved_ip=$(grep -o '"host": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                    elif [[ -n "$saved_ip" && "$saved_ip" != "127.0.0.1" ]]; then
+                        # Use saved IP from previous run
                         echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
-                        if [[ -n "$saved_ip" && "$saved_ip" != "127.0.0.1" ]]; then
-                            echo "IP Address: $saved_ip"
-                        fi
+                        echo "IP Address: $saved_ip (from previous session - may have changed)"
+                    else
+                        # No IP available, show hostname only
+                        echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
+                        echo "Use './vm ip ${name}' to get the current IP address"
                     fi
                 else
                     echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@127.0.0.1 -p ${ssh_port} using password: ${password}"
