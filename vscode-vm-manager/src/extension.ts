@@ -51,6 +51,29 @@ async function handleScriptNotFound(context: vscode.ExtensionContext): Promise<v
     }
 }
 
+async function handleSudoRequired(vmName: string): Promise<void> {
+    const username = process.env.USER || 'your-username';
+    const action = await vscode.window.showErrorMessage(
+        `VM '${vmName}' requires sudo permissions to stop.\n\n` +
+        `This VM is running as root (bridge networking) and cannot be stopped without passwordless sudo.\n\n` +
+        `To fix this, run the following command in your terminal:\n` +
+        `echo '${username} ALL=(root) NOPASSWD: /bin/kill' | sudo tee /etc/sudoers.d/vm_manager_kill && sudo chmod 440 /etc/sudoers.d/vm_manager_kill`,
+        'Copy Command',
+        'Open Terminal',
+        'Dismiss'
+    );
+
+    if (action === 'Copy Command') {
+        const command = `echo '${username} ALL=(root) NOPASSWD: /bin/kill' | sudo tee /etc/sudoers.d/vm_manager_kill && sudo chmod 440 /etc/sudoers.d/vm_manager_kill`;
+        await vscode.env.clipboard.writeText(command);
+        vscode.window.showInformationMessage('Command copied to clipboard. Run it in your terminal to enable passwordless VM stop.');
+    } else if (action === 'Open Terminal') {
+        const terminal = vscode.window.createTerminal('VM Manager Setup');
+        terminal.show();
+        vscode.window.showInformationMessage('Run the command shown in the error message to enable passwordless VM stop.');
+    }
+}
+
 export function activate(context: vscode.ExtensionContext) {
     const scriptUtils = new VmScriptUtils();
     const vmTreeProvider = new VmTreeProvider(scriptUtils);
@@ -216,8 +239,10 @@ export function activate(context: vscode.ExtensionContext) {
             } catch (error: any) {
                 if (error.message === 'VM_SCRIPT_NOT_FOUND') {
                     await handleScriptNotFound(context);
+                } else if (error.message === 'VM_REQUIRES_SUDO') {
+                    await handleSudoRequired(vm.name);
                 } else {
-                    vscode.window.showErrorMessage(`Failed to stop VM: ${error}`);
+                    vscode.window.showErrorMessage(`Failed to stop VM: ${error.message || error}`);
                 }
             }
         }),

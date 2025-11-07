@@ -48,9 +48,8 @@ export class VmScriptUtils {
 
         try {
             const { stdout, stderr } = await execAsync(command);
-            if (stderr) {
-                throw new Error(stderr);
-            }
+            // Don't treat all stderr as errors - some commands output info to stderr
+            // Only fail if the command itself failed (non-zero exit)
             return stdout.trim();
         } catch (error: any) {
             // Check if the error is due to script not being found
@@ -59,7 +58,17 @@ export class VmScriptUtils {
                 error.code === 'ENOENT') {
                 throw new Error('VM_SCRIPT_NOT_FOUND');
             }
-            throw new Error(error.message || 'Command execution failed');
+
+            // Check if it's a sudo/permission error
+            if (error.message.includes('cannot be stopped without sudo') ||
+                error.message.includes('NOPASSWD: /bin/kill') ||
+                error.message.includes('Failed to send stop signal')) {
+                throw new Error('VM_REQUIRES_SUDO');
+            }
+
+            // Include both stdout and stderr in error for better debugging
+            const errorMsg = error.stderr || error.stdout || error.message || 'Command execution failed';
+            throw new Error(errorMsg);
         }
     }
 
@@ -171,23 +180,28 @@ export class VmScriptUtils {
                 let ipAddress = '-';
                 if (isRunning) {
                     if (netType === 'bridge') {
-                        // For bridge mode, try to resolve mDNS hostname
-                        try {
-                            const { stdout } = await execAsync(`ping -c 1 -t 1 ${hostname} 2>/dev/null | grep -oE '\\([0-9.]+\\)' | tr -d '()'`);
-                            const resolvedIP = stdout.trim();
-                            if (resolvedIP && resolvedIP.match(/^\d+\.\d+\.\d+\.\d+$/)) {
-                                ipAddress = resolvedIP;
-                            }
-                        } catch {
-                            // If ping fails, try using arp to find IP
+                        // First, try to read IP from info.json (cached by CLI script)
+                        if (info.ssh && info.ssh.host && info.ssh.host !== 'dhcp-assigned' && info.ssh.host !== '127.0.0.1') {
+                            ipAddress = info.ssh.host;
+                        } else {
+                            // Fallback: try to resolve mDNS hostname
                             try {
-                                const { stdout } = await execAsync(`arp -a | grep -i "${hostname}" | grep -oE '\\([0-9.]+\\)' | tr -d '()'`);
-                                const arpIP = stdout.trim();
-                                if (arpIP && arpIP.match(/^\d+\.\d+\.\d+\.\d+$/)) {
-                                    ipAddress = arpIP;
+                                const { stdout } = await execAsync(`ping -c 1 -t 1 ${hostname} 2>/dev/null | grep -oE '\\([0-9.]+\\)' | tr -d '()'`);
+                                const resolvedIP = stdout.trim();
+                                if (resolvedIP && resolvedIP.match(/^\d+\.\d+\.\d+\.\d+$/)) {
+                                    ipAddress = resolvedIP;
                                 }
                             } catch {
-                                ipAddress = '-';
+                                // If ping fails, try using arp to find IP
+                                try {
+                                    const { stdout } = await execAsync(`arp -a | grep -i "${hostname}" | grep -oE '\\([0-9.]+\\)' | tr -d '()'`);
+                                    const arpIP = stdout.trim();
+                                    if (arpIP && arpIP.match(/^\d+\.\d+\.\d+\.\d+$/)) {
+                                        ipAddress = arpIP;
+                                    }
+                                } catch {
+                                    ipAddress = '-';
+                                }
                             }
                         }
                     } else {
@@ -244,10 +258,19 @@ export class VmScriptUtils {
         }
 
         await this.executeCommand(args);
+
+        // Wait a moment for the VM to fully initialize and get its IP
+        // The CLI script extracts IP from console.log after cloud-init completes
+        if (options.name) {
+            await this.waitForVmIp(options.name, 10);
+        }
     }
 
     async startVm(name: string): Promise<void> {
         await this.executeCommand(['start', name]);
+
+        // Wait a moment for the VM to get its IP
+        await this.waitForVmIp(name, 10);
     }
 
     async stopVm(name: string): Promise<void> {
@@ -274,6 +297,46 @@ export class VmScriptUtils {
         }
 
         throw new Error('Could not determine VM IP');
+    }
+
+    private async waitForVmIp(name: string, maxRetries: number = 10): Promise<string | null> {
+        // Wait for the VM info.json to be updated with IP address
+        // The CLI script updates this after cloud-init completes
+        const vmDir = path.join(os.homedir(), '.vm', 'vms', name);
+        const infoPath = path.join(vmDir, 'info.json');
+
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                if (fs.existsSync(infoPath)) {
+                    const infoData = fs.readFileSync(infoPath, 'utf8');
+                    const info = JSON.parse(infoData);
+
+                    // Check if IP is available in info.json
+                    if (info.ssh && info.ssh.host && info.ssh.host !== 'dhcp-assigned' && info.ssh.host !== '127.0.0.1') {
+                        return info.ssh.host;
+                    }
+
+                    // For bridge mode, also try to get IP via the CLI command
+                    if (info.net_type === 'bridge') {
+                        try {
+                            const ip = await this.getVmIp(name);
+                            if (ip && !ip.includes('not running') && !ip.includes('Could not')) {
+                                return ip;
+                            }
+                        } catch {
+                            // IP not available yet, continue waiting
+                        }
+                    }
+                }
+            } catch (error) {
+                // Continue retrying
+            }
+
+            // Wait 2 seconds before next retry
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+
+        return null;
     }
 
     async getAvailableImages(): Promise<string[]> {

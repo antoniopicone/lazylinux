@@ -1405,6 +1405,28 @@ vm_create() {
         done
 
         echo -e "${GREEN}✔${NC} Completed creating $total_vms VMs"
+        echo
+        echo "VM Summary:"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Show summary of created VMs with their IPs
+        for vm_name in "${vm_names[@]}"; do
+            vm_name=$(echo "$vm_name" | xargs)
+            local vm_info_file="$VMS_DIR/$vm_name/info.json"
+
+            if [[ -f "$vm_info_file" ]]; then
+                local vm_ip=$(grep -o '"host": "[^"]*"' "$vm_info_file" 2>/dev/null | cut -d'"' -f4)
+                local vm_user=$(grep -o '"username": "[^"]*"' "$vm_info_file" 2>/dev/null | cut -d'"' -f4)
+
+                if [[ -n "$vm_ip" && "$vm_ip" != "127.0.0.1" && "$vm_ip" != "dhcp-assigned" ]]; then
+                    printf "  %-20s → %s (ssh %s@%s)\n" "$vm_name" "$vm_ip" "$vm_user" "$vm_ip"
+                else
+                    printf "  %-20s → %s.local (IP pending...)\n" "$vm_name" "$vm_name"
+                fi
+            fi
+        done
+
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         return 0
     fi
 
@@ -2228,8 +2250,24 @@ vm_stop() {
     if [[ "$shutdown_success" == false ]]; then
         log "QEMU monitor not available, using kill signal..."
         if [[ "$is_root_process" == true ]]; then
-            if sudo kill -TERM "$pid" >/dev/null 2>&1; then
+            # Try passwordless sudo first
+            if sudo -n kill -TERM "$pid" >/dev/null 2>&1; then
                 shutdown_success=true
+            else
+                # Cannot use interactive sudo in non-interactive context
+                # Provide guidance on how to enable passwordless sudo
+                echo ""
+                echo "${YELLOW}WARNING:${NC} This VM is running as root and cannot be stopped without sudo access."
+                echo ""
+                echo "To enable passwordless VM stop, add this to your sudoers file:"
+                echo "${GREEN}  $USER ALL=(root) NOPASSWD: /bin/kill${NC}"
+                echo ""
+                echo "Run this command to configure it:"
+                echo "${GREEN}  echo '$USER ALL=(root) NOPASSWD: /bin/kill' | sudo tee /etc/sudoers.d/vm_manager_kill${NC}"
+                echo ""
+                echo "Or manually stop the VM with:"
+                echo "${GREEN}  sudo kill -TERM $pid${NC}"
+                echo ""
             fi
         else
             if kill -TERM "$pid" >/dev/null 2>&1; then
