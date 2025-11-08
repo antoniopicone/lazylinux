@@ -2197,17 +2197,27 @@ vm_stop() {
         fi
     fi
 
-    # If pidfile didn't work, try pgrep
+    # If pidfile didn't work, try pgrep to find ALL processes for this VM
     if [[ -z "$pid" ]]; then
-        pid=$(pgrep -f "qemu.*-name $name" | head -1)
-        if [[ -z "$pid" ]]; then
+        local all_pids=$(pgrep -f "qemu.*-name $name")
+        if [[ -z "$all_pids" ]]; then
             log "VM '$name' is not running"
             return
         fi
+        # Use the first PID for initial shutdown attempt
+        pid=$(echo "$all_pids" | head -1)
         # Check if this process is owned by root
         if [[ $(ps -o user= -p "$pid") == "root" ]]; then
             is_root_process=true
         fi
+    else
+        # Even if we have a PID from pidfile, check for duplicates
+        local all_pids=$(pgrep -f "qemu.*-name $name")
+    fi
+
+    local pid_count=$(echo "$all_pids" | wc -w)
+    if [[ $pid_count -gt 1 ]]; then
+        log "WARNING: Found $pid_count QEMU processes for VM '$name'. Will stop all of them."
     fi
 
     log "Found VM process with PID: $pid. Sending shutdown signal..."
@@ -2296,11 +2306,30 @@ vm_stop() {
             sleep 2
         fi
 
-        if ! ps -p "$pid" > /dev/null 2>&1; then
+        # Kill any remaining QEMU processes for this VM
+        local remaining_pids=$(pgrep -f "qemu.*-name $name" 2>/dev/null || true)
+        if [[ -n "$remaining_pids" ]]; then
+            log "Cleaning up remaining QEMU processes..."
+            for remaining_pid in $remaining_pids; do
+                if [[ "$remaining_pid" != "$pid" ]]; then
+                    log "Killing orphaned process: $remaining_pid"
+                    if [[ $(ps -o user= -p "$remaining_pid" 2>/dev/null) == "root" ]]; then
+                        sudo kill -KILL "$remaining_pid" 2>/dev/null || true
+                    else
+                        kill -KILL "$remaining_pid" 2>/dev/null || true
+                    fi
+                fi
+            done
+            sleep 1
+        fi
+
+        # Final check
+        local final_check=$(pgrep -f "qemu.*-name $name" 2>/dev/null || true)
+        if [[ -z "$final_check" ]]; then
             log "VM stopped successfully"
             rm -f "$pid_file"
         else
-            error "Failed to stop VM"
+            error "Failed to stop all VM processes. Remaining PIDs: $final_check"
         fi
     else
         error "Failed to send stop signal to VM"
@@ -2433,13 +2462,11 @@ vm_delete() {
         error "VM '$name' does not exist"
     fi
     
-    local pid_file="$vm_dir/qemu.pid"
-    if [[ -f "$pid_file" ]]; then
-        local pid=$(cat "$pid_file" 2>/dev/null || true)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            log "Stopping running VM before deletion..."
-            vm_stop "$name"
-        fi
+    # Check for ANY running QEMU processes for this VM (not just pidfile)
+    local running_pids=$(pgrep -f "qemu.*-name $name" 2>/dev/null || true)
+    if [[ -n "$running_pids" ]]; then
+        log "Stopping running VM before deletion..."
+        vm_stop "$name"
     fi
     
     if [[ "$force" == false ]]; then
@@ -2512,6 +2539,98 @@ purge() {
     [[ -d "$WORK_ROOT" ]] && rmdir "$WORK_ROOT" 2>/dev/null
     
     log "Deleted $vm_count VM(s)"
+}
+
+cleanup_orphaned_processes() {
+    log "Checking for orphaned QEMU processes..."
+
+    # Get all QEMU processes
+    local all_qemu_pids=$(pgrep -f "qemu-system" 2>/dev/null || true)
+
+    if [[ -z "$all_qemu_pids" ]]; then
+        log "No QEMU processes found"
+        return
+    fi
+
+    local orphaned_pids=()
+    local orphaned_names=()
+
+    # Check each QEMU process
+    for qemu_pid in $all_qemu_pids; do
+        # Get the VM name from the process command line
+        local vm_name=$(ps -p "$qemu_pid" -o command= 2>/dev/null | grep -o '\-name [^ ]*' | cut -d' ' -f2)
+
+        if [[ -z "$vm_name" ]]; then
+            continue
+        fi
+
+        # Check if VM directory exists
+        local vm_dir="$VMS_DIR/$vm_name"
+        if [[ ! -d "$vm_dir" ]]; then
+            orphaned_pids+=("$qemu_pid")
+            orphaned_names+=("$vm_name")
+        fi
+    done
+
+    if [[ ${#orphaned_pids[@]} -eq 0 ]]; then
+        log "No orphaned QEMU processes found"
+        return
+    fi
+
+    log "Found ${#orphaned_pids[@]} orphaned QEMU process(es):"
+
+    # Check how many are root processes
+    local root_count=0
+    for qemu_pid in "${orphaned_pids[@]}"; do
+        local process_owner=$(ps -o user= -p "$qemu_pid" 2>/dev/null)
+        if [[ "$process_owner" == "root" ]]; then
+            ((root_count++))
+        fi
+    done
+
+    for i in "${!orphaned_pids[@]}"; do
+        local process_owner=$(ps -o user= -p "${orphaned_pids[$i]}" 2>/dev/null)
+        echo "  - PID ${orphaned_pids[$i]}: VM '${orphaned_names[$i]}' (directory not found) [owner: $process_owner]"
+    done
+
+    if [[ $root_count -gt 0 ]]; then
+        echo ""
+        echo "Note: $root_count process(es) are owned by root and require sudo to kill"
+    fi
+
+    echo ""
+    read -p "Kill these orphaned processes? (y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log "Cleanup cancelled"
+        return
+    fi
+
+    # If we have root processes, verify sudo access upfront
+    if [[ $root_count -gt 0 ]]; then
+        log "Verifying sudo access for root processes..."
+        if ! sudo -v; then
+            error "Cannot obtain sudo access"
+        fi
+    fi
+
+    log "Killing orphaned processes..."
+    local killed_count=0
+    for qemu_pid in "${orphaned_pids[@]}"; do
+        if ps -p "$qemu_pid" > /dev/null 2>&1; then
+            local process_owner=$(ps -o user= -p "$qemu_pid" 2>/dev/null)
+            if [[ "$process_owner" == "root" ]]; then
+                if sudo kill -KILL "$qemu_pid" 2>/dev/null; then
+                    ((killed_count++))
+                fi
+            else
+                if kill -KILL "$qemu_pid" 2>/dev/null; then
+                    ((killed_count++))
+                fi
+            fi
+        fi
+    done
+
+    log "Killed $killed_count orphaned process(es)"
 }
 
 install_command() {
@@ -2602,6 +2721,7 @@ COMMANDS:
     ip VM_NAME          Find IP address of a bridge mode VM
     ssh VM_NAME         SSH into a VM
     purge               Delete all VMs (--force for no confirmation)
+    cleanup             Find and kill orphaned QEMU processes
     diagnose            Run network diagnostics
     uninstall           Remove from system PATH
     help                Show this help
@@ -2672,6 +2792,7 @@ main() {
         ip) shift; vm_ip "$@" ;;
         ssh) shift; vm_ssh "$@" ;;
         purge) shift; purge "$@" ;;
+        cleanup) cleanup_orphaned_processes ;;
         diagnose) diagnose_network ;;
         setup-bridge) shift; setup_bridge_networking "$@" ;;
         install) shift; install_command "$@" ;;
