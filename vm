@@ -1,18 +1,5 @@
 #!/bin/bash
 
-set -e
-
-# Check if running as root - this script should not be run as root
-if [[ $EUID -eq 0 ]]; then
-    echo "ERROR: This script should NOT be run as root or with sudo." >&2
-    echo "" >&2
-    echo "The script will prompt for sudo password when needed (e.g., for bridge networking)." >&2
-    echo "Please run it as your normal user without sudo:" >&2
-    echo "  ./vm <command>" >&2
-    echo "" >&2
-    exit 1
-fi
-
 # Configuration
 WORK_ROOT="$HOME/.vm"
 IMAGES_DIR="$WORK_ROOT/images"
@@ -56,6 +43,20 @@ GRAY='\033[0;90m'
 YELLOW='\033[0;33m'
 DARK_YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
+
+
+set -e
+
+# Check if running as root - this script should not be run as root
+if [[ $EUID -eq 0 ]]; then
+    echo -e "${RED}[ERROR]${NC} This script should NOT be run as root or with sudo." >&2
+    echo "" >&2
+    echo "The script will prompt for sudo password when needed (e.g., for bridge networking)." >&2
+    echo "Please run it as your normal user without sudo:" >&2
+    echo "  ./vm <command>" >&2
+    echo "" >&2
+    exit 1
+fi
 
 log() {
     echo "[$(date '+%H:%M:%S')] $*"
@@ -422,22 +423,15 @@ is_wifi_interface() {
 }
 
 setup_bridge_networking() {
-    echo "Setting up bridge networking with passwordless sudo (requires sudo password once)..."
-    echo
-
     # Check if socket_vmnet is installed
     if ! brew list socket_vmnet >/dev/null 2>&1; then
-        echo "Installing socket_vmnet..."
-        if brew install socket_vmnet; then
-            echo -e "${GREEN}✔${NC} socket_vmnet installed successfully"
+        echo -e "Installing socket_vmnet..."
+        if brew install socket_vmnet >/dev/null 2>&1; then
+            echo -e "${GREEN}✔${NC} socket_vmnet installed"
         else
             error "Failed to install socket_vmnet"
         fi
-    else
-        echo -e "${GREEN}✔${NC} socket_vmnet is already installed"
     fi
-
-    echo
 
     # Detect primary network interface
     local primary_interface=$(detect_primary_network_interface)
@@ -447,39 +441,33 @@ setup_bridge_networking() {
         return 1
     fi
 
-    echo "Detected primary network interface: $primary_interface"
     local interface_ip=$(ifconfig "$primary_interface" | grep "inet " | awk '{print $2}')
-    echo "Interface IP: $interface_ip"
+    echo -e "Using network interface: $primary_interface ($interface_ip)"
 
     # Warn if using WiFi interface
     if is_wifi_interface "$primary_interface"; then
         echo
-        echo -e "${YELLOW}[!] WARNING:${NC} The detected interface ($primary_interface) is likely WiFi"
-        echo "    WiFi interfaces on macOS do NOT support bridge networking properly"
-        echo "    VMs may not be able to obtain IP addresses or communicate on the network"
-        echo
-        echo "    Recommendations:"
-        echo "    1. Use an Ethernet adapter (USB-C to Ethernet)"
-        echo "    2. Or use port forwarding mode: ./vm create --net-type portfwd"
+        echo -e "${YELLOW}[!] WARNING:${NC} WiFi interface detected ($primary_interface)"
+        echo "    WiFi on macOS does NOT support bridge networking properly"
+        echo "    Consider using Ethernet or port forwarding mode (--net-type portfwd)"
         echo
         read -p "Continue anyway? (y/N): " wifi_continue
         if [[ "$wifi_continue" != "y" && "$wifi_continue" != "Y" ]]; then
-            echo "Setup cancelled. Use port forwarding mode or connect via Ethernet."
+            echo "Setup cancelled."
             return 1
         fi
     fi
-    echo
 
     # Create socket_vmnet configuration directory
     local config_dir="$BREW_PREFIX/etc/socket_vmnet"
     local config_file="$config_dir/config"
 
     if [[ ! -f "$config_file" ]]; then
-        echo "Creating socket_vmnet configuration..."
-        echo "This requires sudo password to create config in $config_dir"
-
+        echo -e "Creating socket_vmnet configuration..."
+        echo -e "${YELLOW}[!]${NC} This command requires your password to proceed:"
+        echo 
         # Create config directory if it doesn't exist
-        sudo mkdir -p "$config_dir" || {
+        sudo mkdir -p "$config_dir" >/dev/null 2>&1 || {
             error "Failed to create socket_vmnet config directory"
         }
 
@@ -492,97 +480,75 @@ interface $primary_interface
 EOF
 
         if [[ -f "$config_file" ]]; then
-            echo -e "${GREEN}✔${NC} Created configuration file: $config_file"
-            echo "Configuration:"
-            sudo cat "$config_file" | grep -v "^#" | grep -v "^$"
+            echo -e "${GREEN}✔${NC} Configuration created"
         else
             error "Failed to create socket_vmnet configuration file"
         fi
-    else
-        echo -e "${GREEN}✔${NC} Configuration file already exists: $config_file"
-        echo "Current configuration:"
-        sudo cat "$config_file" | grep -v "^#" | grep -v "^$"
     fi
 
-    echo
-
     if socket_vmnet_ready; then
-        echo -e "${YELLOW}[!]${NC} socket_vmnet service already running, restarting with new configuration..."
-        if sudo brew services restart socket_vmnet; then
-            echo -e "${GREEN}✔${NC} socket_vmnet service restarted"
+        echo -e "Restarting socket_vmnet service..."
+        echo -e "${YELLOW}[!]${NC} This command requires your password to proceed:"
+        echo
+        if sudo brew services restart socket_vmnet >/dev/null 2>&1; then
+            echo -e "${GREEN}✔${NC} Service restarted"
         else
             error "Failed to restart socket_vmnet service"
         fi
     else
-        echo "Starting socket_vmnet service (this will prompt for sudo password)..."
-        if sudo brew services start socket_vmnet; then
-            echo -e "${GREEN}✔${NC} socket_vmnet service started"
+        echo -e "Starting socket_vmnet service..."
+        echo -e "${YELLOW}[!]${NC} This command requires your password to proceed:"
+        echo
+        if sudo brew services start socket_vmnet >/dev/null 2>&1; then
+            echo -e "${GREEN}✔${NC} Service started"
         else
             error "Failed to start socket_vmnet service"
         fi
     fi
 
-    echo
-    echo "Waiting for service to initialize..."
+    echo -e "${BLUE}[i]${NC} Waiting for service to initialize..."
     sleep 3
 
     if socket_vmnet_ready; then
         echo -e "${GREEN}✔${NC} Bridge networking is ready!"
-        echo "VMs will be bridged to interface: $primary_interface ($interface_ip)"
-        echo
 
         # Configure passwordless sudo (always)
         local sudoers_file="/etc/sudoers.d/socket_vmnet_client"
 
-        echo "Configuring sudo to allow passwordless execution of socket_vmnet_client..."
-        echo
-        echo -e "${YELLOW}INFO:${NC} This will allow your user to run socket_vmnet_client without password."
-        echo "This is safe as it only affects specific commands for VM management."
-        echo
-        echo "The following lines will be added to $sudoers_file:"
-        echo "  $USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT"
-        echo "  $USER ALL=(ALL) NOPASSWD: /bin/chmod 666 $HOME/.vm/vms/*/monitor.sock"
-        echo
-        echo "Note: The chmod permission is needed to fix monitor socket permissions after VM creation."
-        echo
-        read -p "Continue? (Y/n): " confirm
-
-        if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
-            echo "Setup cancelled."
+        if [[ ! -f "$sudoers_file" ]]; then
             echo
-            echo "Note: Without passwordless sudo, you will be prompted for your password"
-            echo "every time you create or start a VM with bridge networking."
-            return 1
-        fi
+            echo -e "${BLUE}[i]${NC} Configuring passwordless sudo for VM operations..."
+            echo -e "${BLUE}[INFO]${NC} This command requires your password to proceed"
+            echo
+            read -p "Continue? (Y/n): " confirm
 
-        # Allow both socket_vmnet_client and chmod for monitor sockets
-        cat <<EOF | sudo tee "$sudoers_file" > /dev/null
+            if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+                echo "Setup cancelled."
+                return 1
+            fi
+
+            # Allow both socket_vmnet_client and chmod for monitor sockets
+            cat <<EOF | sudo tee "$sudoers_file" > /dev/null
 $USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT
 $USER ALL=(ALL) NOPASSWD: /bin/chmod 666 $HOME/.vm/vms/*/monitor.sock
 EOF
 
-        if [[ -f "$sudoers_file" ]]; then
-            # Set correct permissions on sudoers file
-            sudo chmod 0440 "$sudoers_file"
+            if [[ -f "$sudoers_file" ]]; then
+                # Set correct permissions on sudoers file
+                sudo chmod 0440 "$sudoers_file" 2>/dev/null
 
-            # Validate sudoers file
-            if sudo visudo -c -f "$sudoers_file" >/dev/null 2>&1; then
-                echo -e "${GREEN}✔${NC} Sudo configuration successful!"
-                echo
-                echo "You can now create VMs without password prompts:"
-                echo "  $0 create --net-type bridge"
+                # Validate sudoers file
+                if sudo visudo -c -f "$sudoers_file" >/dev/null 2>&1; then
+                    echo -e "${GREEN}✔${NC} Passwordless sudo configured"
+                else
+                    echo -e "${RED}✗${NC} Configuration validation failed"
+                    sudo rm -f "$sudoers_file"
+                    error "Failed to configure sudo"
+                fi
             else
-                echo -e "${RED}✗${NC} Sudoers file validation failed! Removing invalid file..."
-                sudo rm -f "$sudoers_file"
-                error "Failed to configure sudo. Please check permissions."
+                error "Failed to write sudoers file"
             fi
-        else
-            error "Failed to write sudoers file"
         fi
-
-        echo
-        echo "Bridge networking is fully configured!"
-        echo "You can now create VMs with: $0 create --net-type bridge"
     else
         echo -e "${YELLOW}[!]${NC} socket_vmnet service reported as running but socket ${SOCKET_VMNET_SOCKET} not found."
         echo "The service may need more time to initialize or may need a restart."
@@ -1816,8 +1782,8 @@ vm_list() {
     
     local vm_count=0
     echo
-    printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "NAME" "STATUS" "ARCH" "IMAGE" "HOSTNAME" "CREDENTIALS"
-    printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "----" "------" "----" "-----" "--------" "-----------"
+    printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "NAME" "STATUS" "ARCH" "IMAGE" "IP ADDRESS" "CREDENTIALS"
+    printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "----" "------" "----" "-----" "----------" "-----------"
     
     for vm_dir in "$VMS_DIR"/*; do
         if [[ ! -d "$vm_dir" ]]; then
@@ -1859,19 +1825,26 @@ vm_list() {
         
         if [[ "$is_running" == "true" ]]; then
             status="RUNNING"
-            
+
             # Extract info from JSON
             local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
             local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
             local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
             local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
-            
+
             # Default to portfwd if net_type is not found
             [[ -z "$net_type" ]] && net_type="portfwd"
-            
+
             if [[ "$net_type" == "bridge" ]]; then
-                local sanitized_hostname=$(sanitize_hostname "$vm_name")
-                ssh_info="${sanitized_hostname}.local"
+                # Try to get IP from info.json first
+                local vm_ip=$(grep -o '"host": "[^"]*"' "$info_file" | head -1 | cut -d'"' -f4)
+                if [[ -n "$vm_ip" && "$vm_ip" != "dhcp-assigned" ]]; then
+                    ssh_info="$vm_ip"
+                else
+                    # Fallback to hostname.local if IP not available
+                    local sanitized_hostname=$(sanitize_hostname "$vm_name")
+                    ssh_info="${sanitized_hostname}.local"
+                fi
             else
                 ssh_info="127.0.0.1:$port"
             fi
@@ -2644,14 +2617,89 @@ cleanup_orphaned_processes() {
     log "Killed $killed_count orphaned process(es)"
 }
 
+install_vscode_extension() {
+    local script_dir="$(cd "$(dirname "$0")" && pwd)"
+    local vscode_dir="$script_dir/vscode-vm-manager"
+
+    if [[ ! -d "$vscode_dir" ]]; then
+        echo -e "${YELLOW}[!]${NC} VS Code extension directory not found at: $vscode_dir"
+        echo "Skipping extension installation"
+        return
+    fi
+
+    # Check if npm is available
+    if ! command -v npm &> /dev/null; then
+        echo -e "${YELLOW}[!]${NC} npm not found. Installing Node.js with Homebrew..."
+        if ! command -v brew &> /dev/null; then
+            echo -e "${RED}[ERROR]${NC} Homebrew is required but not installed"
+            echo "Please install Homebrew from https://brew.sh/"
+            return 1
+        fi
+        brew install node >/dev/null 2>&1 || {
+            echo -e "${RED}[ERROR]${NC} Failed to install Node.js"
+            return 1
+        }
+        echo -e "${GREEN}✔${NC} Node.js installed"
+    fi
+
+    # Check if vsce is available
+    if ! command -v vsce &> /dev/null; then
+        echo "Installing vsce (VS Code Extension Manager)..."
+        npm install -g @vscode/vsce >/dev/null 2>&1 || {
+            echo -e "${RED}[ERROR]${NC} Failed to install vsce"
+            return 1
+        }
+        echo -e "${GREEN}✔${NC} vsce installed"
+    fi
+
+    cd "$vscode_dir" || {
+        echo -e "${RED}[ERROR]${NC} Failed to enter directory: $vscode_dir"
+        return 1
+    }
+
+    echo "Compiling TypeScript..."
+    npm run compile >/dev/null 2>&1 || {
+        echo -e "${RED}[ERROR]${NC} Failed to compile extension"
+        return 1
+    }
+    echo -e "${GREEN}✔${NC} Extension compiled"
+
+    echo "Packaging extension..."
+    vsce package --allow-star-activation >/dev/null 2>&1 || {
+        echo -e "${RED}[ERROR]${NC} Failed to package extension"
+        return 1
+    }
+    echo -e "${GREEN}✔${NC} Extension packaged"
+
+    local vsix_file=$(ls -t vm-manager-*.vsix 2>/dev/null | head -1)
+    if [[ -z "$vsix_file" ]]; then
+        echo -e "${RED}[ERROR]${NC} Could not find packaged .vsix file"
+        return 1
+    fi
+
+    local vsix_path="$vscode_dir/$vsix_file"
+    echo
+    echo -e "${GREEN}✔${NC} Extension built successfully: ${BLUE}$vsix_path${NC}"
+    echo
+    echo "To install the extension in VS Code:"
+    echo "  1. Open VS Code"
+    echo "  2. Press Cmd+Shift+P (or Ctrl+Shift+P on Linux)"
+    echo "  3. Type 'Extensions: Install from VSIX'"
+    echo "  4. Select the file: $vsix_path"
+    echo
+    echo "Or from command line (if 'code' command is available):"
+    echo -e "  ${BLUE}code --install-extension $vsix_path${NC}"
+}
+
 install_command() {
     local install_path="${1:-/usr/local/bin}"
     local script_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
     local target_path="$install_path/vm"
 
-    echo "========================================"
-    echo "  LazyLinux VM Manager Installation"
-    echo "========================================"
+    echo
+    echo -e "${BLUE}${NC}${GREEN}LazyLinux VM Manager${NC}          "
+    echo -e "${BLUE}${NC}Installation                        "
+    echo -e "${BLUE}═══════════════════════════════"
     echo
 
     if [[ ! -f "$script_path" ]]; then
@@ -2662,35 +2710,42 @@ install_command() {
         error "Directory $install_path does not exist"
     fi
 
-    echo "Step 1: Installing vm command to $target_path"
+    echo -e "${BLUE}[1/3]${NC} Installing vm command in $install_path"
     if [[ -f "$target_path" ]]; then
-        echo "Warning: File already exists and will be overwritten"
+        echo -e "${YELLOW}[!]${NC} File already exists and will be overwritten"
     fi
-    read -p "Continue with installation? (Y/n): " confirm
+    echo
+    read -p "Continue? (Y/n): " confirm
     if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
-        log "Installation cancelled"
+        echo "Installation cancelled"
         return
     fi
 
     if cp "$script_path" "$target_path" && chmod +x "$target_path"; then
-        echo -e "${GREEN}✔${NC} Successfully installed vm command to: $target_path"
+        echo -e "${GREEN}✔${NC} Command installed to: $target_path"
         echo
 
         # Run bridge networking setup
-        echo "Step 2: Setting up bridge networking..."
+        echo -e "${BLUE}[2/3]${NC} Setting up bridge networking"
         echo
         setup_bridge_networking
 
+        # Optional VS Code extension installation
         echo
-        echo "========================================"
-        echo -e "${GREEN}✔ Installation Complete!${NC}"
-        echo "========================================"
+        echo -e "${BLUE}[3/3]${NC} VS Code Extension (Optional)"
         echo
-        echo "You can now run: vm --help"
-        echo "Make sure $install_path is in your PATH"
+        read -p "Build the VS Code extension for VM management? (y/N): " vscode_confirm
+        if [[ "$vscode_confirm" == "y" || "$vscode_confirm" == "Y" ]]; then
+            install_vscode_extension
+        else
+            echo "Skipping VS Code extension build"
+        fi
+
         echo
-        echo "To create your first VM:"
-        echo "  vm create --name myvm"
+        echo -e "${GREEN}✔ Installation Complete!   ${NC}"
+        echo
+        echo "Create your first VM with:"
+        echo -e "  ${BLUE}vm create${NC}"
     else
         error "Failed to install. You may need to run with sudo: sudo $0 install"
     fi
@@ -2750,18 +2805,6 @@ CREATE OPTIONS:
     --net-type TYPE     Network type (default: bridge, options: bridge, portfwd)
     --show-console      Show console output
     --debug             Show debug information
-
-NETWORK TYPES:
-    bridge          Bridged networking - VMs get IP from your network DHCP
-                    • Automatically configured during installation
-                    • VMs accessible via mDNS: ssh user@hostname.local
-                    • Best for: VM-to-VM communication, network services
-
-    portfwd         Port forwarding - SSH via localhost ports
-                    • No special setup required
-                    • No sudo password needed
-                    • VMs accessible via: ssh user@127.0.0.1 -p PORT
-                    • Best for: Development, single VM access
 
 INSTALLATION:
     First-time setup (installs vm command + configures bridge networking):
