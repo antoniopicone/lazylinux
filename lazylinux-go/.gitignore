@@ -1,0 +1,37 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+vm
+*.test
+*.out
+
+# Build directory
+build/
+dist/
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Test coverage
+coverage.out
+coverage.html
+
+# VM data (for testing)
+.vm-test/
+
+# Temporary files
+*.tmp
+*.log

@@ -1,0 +1,42 @@
+# LazyLinux VM Manager Configuration Example
+# Copy this file to ~/.vm/config.yaml to customize settings
+
+# Working directory for VM manager
+work_root: ~/.vm
+
+# Directory for base images
+images_dir: ~/.vm/images
+
+# Directory for VM instances
+vms_dir: ~/.vm/vms
+
+# Default VM settings
+default_username: user01
+default_memory: 4G
+default_cpus: 2
+default_disk_size: 10G
+default_image: debian13
+
+# Homebrew prefix (automatically detected if not set)
+brew_prefix: /opt/homebrew
+
+# Available images
+images:
+  - name: debian13
+    display_name: Debian 13 (Trixie)
+    urls:
+      arm64: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+      amd64: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+
+  - name: debian12
+    display_name: Debian 12 (Bookworm)
+    urls:
+      arm64: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2
+      amd64: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2
+
+# You can add custom images here:
+# - name: ubuntu2204
+#   display_name: Ubuntu 22.04 LTS
+#   urls:
+#     arm64: https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img
+#     amd64: https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img

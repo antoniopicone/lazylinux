@@ -1,0 +1,54 @@
+#cloud-config
+datasource_list: [ NoCloud, None ]
+final_message: "CLOUD-INIT-READY"
+hostname: {{.Hostname}}
+fqdn: {{.Hostname}}.local
+manage_etc_hosts: true
+package_update: false
+packages:
+  - openssh-server
+  - avahi-daemon
+output:
+  all: '| tee -a /var/log/cloud-init-output.log'
+users:
+  - name: {{.Username}}
+    gecos: {{.Username}}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: '{{.Password}}'
+ssh_pwauth: true
+chpasswd:
+  list: |
+    {{.Username}}:{{.Password}}
+  expire: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      PermitRootLogin prohibit-password
+      UseDNS no
+      GSSAPIAuthentication no
+runcmd:
+  - |
+    # Set hostname persistently
+    hostnamectl set-hostname {{.Hostname}} || echo "{{.Hostname}}" > /etc/hostname
+    hostname {{.Hostname}}
+  - echo "{{.Username}}:{{.Password}}" | chpasswd
+  - passwd -u {{.Username}}
+  - systemctl enable ssh
+  - systemctl enable avahi-daemon
+  - |
+    # Preserve SSH host keys across VM restarts
+    if [ ! -f /etc/ssh/.keys_generated ]; then
+      # Generate SSH host keys on first boot only
+      ssh-keygen -A
+      # Mark that keys have been generated to prevent regeneration
+      touch /etc/ssh/.keys_generated
+    fi
+  - systemctl start ssh
+  - systemctl start avahi-daemon

@@ -1,0 +1,101 @@
+#cloud-config
+datasource_list: [ NoCloud, None ]
+final_message: "CLOUD-INIT-READY"
+hostname: {{.Hostname}}
+fqdn: {{.Hostname}}.local
+manage_etc_hosts: true
+package_update: false
+packages:
+  - openssh-server
+  - avahi-daemon
+  - locales-all
+output:
+  all: '| tee -a /var/log/cloud-init-output.log'
+write_files:
+  - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/lib/systemd/systemd-networkd-wait-online --timeout=3
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    content: |
+      network: {config: disabled}
+  - path: /etc/netplan/01-netcfg.yaml
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          enp0s1:
+{{- if .StaticIP}}
+            addresses:
+              - {{.StaticIP}}/24
+            routes:
+              - to: default
+                via: 192.168.105.1
+            nameservers:
+              addresses: [8.8.8.8, 1.1.1.1]
+            dhcp4: no
+            dhcp6: no
+{{- else}}
+            dhcp4: yes
+            dhcp6: no
+            nameservers:
+              addresses: [8.8.8.8, 1.1.1.1]
+{{- end}}
+  - path: /usr/local/bin/report-ip.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # Wait for network to be ready
+      sleep 5
+      # Get IP address
+      IP=$(ip -4 addr show enp0s1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+      if [ -n "$IP" ]; then
+          echo "VM_IP_ADDRESS: $IP"
+          logger "VM_IP_ADDRESS: $IP"
+      fi
+  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      PermitRootLogin prohibit-password
+      UseDNS no
+      GSSAPIAuthentication no
+users:
+  - name: {{.Username}}
+    gecos: {{.Username}}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: '{{.Password}}'
+ssh_pwauth: true
+chpasswd:
+  list: |
+    {{.Username}}:{{.Password}}
+  expire: false
+runcmd:
+  - |
+    # Set hostname persistently
+    hostnamectl set-hostname {{.Hostname}} || echo "{{.Hostname}}" > /etc/hostname
+    hostname {{.Hostname}}
+  - echo "{{.Username}}:{{.Password}}" | chpasswd
+  - passwd -u {{.Username}}
+  - systemctl enable ssh
+  - systemctl enable avahi-daemon
+  - |
+    # Preserve SSH host keys across VM restarts
+    if [ ! -f /etc/ssh/.keys_generated ]; then
+      # Generate SSH host keys on first boot only
+      ssh-keygen -A
+      # Mark that keys have been generated to prevent regeneration
+      touch /etc/ssh/.keys_generated
+    fi
+  - mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d
+  - systemctl daemon-reload
+  - netplan apply
+  - systemctl start ssh
+  - systemctl start avahi-daemon
