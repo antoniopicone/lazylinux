@@ -72,6 +72,71 @@ sanitize_hostname() {
     echo "${name//_/-}"
 }
 
+# JSON helper functions
+json_get_string() {
+    local file="$1"
+    local field="$2"
+    grep -o "\"$field\": \"[^\"]*\"" "$file" 2>/dev/null | cut -d'"' -f4
+}
+
+json_get_number() {
+    local file="$1"
+    local field="$2"
+    grep -o "\"$field\": [0-9]*" "$file" 2>/dev/null | awk '{print $2}'
+}
+
+# Process management helper functions
+get_vm_pid() {
+    local vm_name="$1"
+    local vm_dir="$VMS_DIR/$vm_name"
+    local pid_file="$vm_dir/qemu.pid"
+    local pid=""
+
+    # Try pidfile first
+    if [[ -f "$pid_file" ]]; then
+        pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+
+    # Fallback to pgrep
+    pid=$(pgrep -f "qemu.*-name $vm_name" 2>/dev/null | head -1)
+    if [[ -n "$pid" ]]; then
+        echo "$pid"
+        return 0
+    fi
+
+    return 1
+}
+
+is_vm_running() {
+    local vm_name="$1"
+    get_vm_pid "$vm_name" >/dev/null 2>&1
+}
+
+is_root_process() {
+    local pid="$1"
+    [[ $(ps -o user= -p "$pid" 2>/dev/null) == "root" ]]
+}
+
+fix_monitor_socket_permissions() {
+    local monitor_socket="$1"
+
+    [[ ! -S "$monitor_socket" ]] && return 1
+
+    # Check if already accessible
+    [[ -r "$monitor_socket" && -w "$monitor_socket" ]] && return 0
+
+    # Try to fix permissions
+    if sudo -n chmod 666 "$monitor_socket" 2>/dev/null; then
+        return 0
+    else
+        sudo chmod 666 "$monitor_socket" 2>/dev/null || return 1
+    fi
+}
+
 # Generate static IP from VM name (deterministic)
 # Uses hash of VM name to generate last octet in range 100-254
 generate_static_ip() {
@@ -376,6 +441,84 @@ update_vm_ip_in_info() {
 
     # Replace the original file
     mv "$temp_file" "$info_file"
+}
+
+# Detect and update VM IP address for bridge mode
+detect_and_update_vm_ip() {
+    local vm_name="$1"
+    local vm_dir="$VMS_DIR/$vm_name"
+    local info_file="$vm_dir/info.json"
+    local console_log="$vm_dir/console.log"
+    local timeout="${2:-90}"
+
+    local detected_ip=$(extract_vm_ip_from_log "$console_log" "$timeout")
+
+    if [[ -n "$detected_ip" ]]; then
+        update_vm_ip_in_info "$info_file" "$detected_ip"
+        echo "$detected_ip"
+        return 0
+    fi
+
+    return 1
+}
+
+# Launch QEMU daemon process
+launch_qemu_daemon() {
+    local vm_name="$1"
+    local vm_dir="$2"
+    local net_type="$3"
+    shift 3
+    local qemu_args=("$@")
+
+    local console_log="$vm_dir/console.log"
+    local pid_file="$vm_dir/qemu.pid"
+    local monitor_socket="$vm_dir/monitor.sock"
+
+    # Add daemon arguments
+    qemu_args+=(
+        "-daemonize"
+        "-display" "none"
+        "-serial" "file:$console_log"
+        "-monitor" "unix:$monitor_socket,server,nowait"
+    )
+
+    # Only add pidfile for non-bridge mode
+    if [[ "$net_type" != "bridge" ]]; then
+        qemu_args+=("-pidfile" "$pid_file")
+    fi
+
+    # Launch QEMU
+    if [[ "$net_type" == "bridge" ]]; then
+        if sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}" >/dev/null 2>&1; then
+            sleep 1
+            fix_monitor_socket_permissions "$monitor_socket" || true
+            return 0
+        fi
+    else
+        if "${qemu_args[@]}" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Show VM ready message with connection info
+show_vm_ready() {
+    local vm_name="$1"
+    local username="$2"
+    local password="$3"
+    local net_type="$4"
+    local connection_detail="$5"
+
+    local sanitized_name=$(sanitize_hostname "$vm_name")
+
+    if [[ "$net_type" == "bridge" ]]; then
+        echo -e "${GREEN}✔${NC} VM ${vm_name} is running and accessible via SSH with ${username}@${sanitized_name}.local using password: ${password}"
+        [[ -n "$connection_detail" ]] && echo "$connection_detail"
+    else
+        echo -e "${GREEN}✔${NC} VM ${vm_name} is running and accessible via SSH with ${username}@127.0.0.1 -p ${connection_detail} using password: ${password}"
+    fi
 }
 
 detect_primary_network_interface() {
@@ -791,8 +934,14 @@ create_cloud_init() {
     # Create temporary directory for cloud-init files
     local tmpdir=$(mktemp -d)
 
-    # Create user-data content with proper indentation
-    local user_data=""
+    # Build common packages list
+    local packages="  - openssh-server
+  - avahi-daemon"
+    [[ "$net_type" == "bridge" ]] && packages+="
+  - locales-all"
+
+    # Build network configuration for bridge mode
+    local network_config=""
     if [[ "$net_type" == "bridge" ]]; then
         # Determine network configuration based on static IP
         local netplan_config=""
@@ -825,22 +974,7 @@ create_cloud_init() {
               addresses: [8.8.8.8, 1.1.1.1]"
         fi
 
-        user_data=$(cat <<EOF
-#cloud-config
-datasource_list: [ NoCloud, None ]
-final_message: "CLOUD-INIT-READY"
-hostname: $hostname
-fqdn: ${hostname}.local
-manage_etc_hosts: true
-package_update: false
-packages:
-  - openssh-server
-  - avahi-daemon
-  - locales-all
-output:
-  all: '| tee -a /var/log/cloud-init-output.log'
-write_files:
-  - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+        network_config="  - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
     content: |
       [Service]
       ExecStart=
@@ -855,63 +989,21 @@ $netplan_config
     permissions: '0755'
     content: |
       #!/bin/bash
-      # Wait for network to be ready
       sleep 5
-      # Get IP address
-      IP=\$(ip -4 addr show enp0s1 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}')
-      if [ -n "\$IP" ]; then
-          echo "VM_IP_ADDRESS: \$IP"
-          logger "VM_IP_ADDRESS: \$IP"
-      fi
-users:
-  - name: $username
-    gecos: $username
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    groups: [sudo]
-    shell: /bin/bash
-    lock_passwd: false
-    plain_text_passwd: '$password'
-ssh_pwauth: true
-chpasswd:
-  list: |
-    $username:$password
-  expire: false
-write_files:
-  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
-    owner: root:root
-    permissions: '0644'
-    content: |
-      PasswordAuthentication yes
-      PubkeyAuthentication yes
-      PermitRootLogin prohibit-password
-      UseDNS no
-      GSSAPIAuthentication no
-runcmd:
-  - |
-    # Set hostname persistently
-    hostnamectl set-hostname $hostname || echo "$hostname" > /etc/hostname
-    hostname $hostname
-  - echo "$username:$password" | chpasswd
-  - passwd -u $username
-  - systemctl enable ssh
-  - systemctl enable avahi-daemon
-  - |
-    # Preserve SSH host keys across VM restarts
-    if [ ! -f /etc/ssh/.keys_generated ]; then
-      # Generate SSH host keys on first boot only
-      ssh-keygen -A
-      # Mark that keys have been generated to prevent regeneration
-      touch /etc/ssh/.keys_generated
+      IP=\$(ip -4 addr show enp0s1 | grep -oP '(?<=inet\\\\s)\\\\d+(\\\\.\\\\d+){3}')
+      [ -n \"\$IP\" ] && echo \"VM_IP_ADDRESS: \$IP\" && logger \"VM_IP_ADDRESS: \$IP\"
+"
     fi
-  - mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d
+
+    # Build runcmd based on network type
+    local runcmd_extra=""
+    [[ "$net_type" == "bridge" ]] && runcmd_extra="  - mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d
   - systemctl daemon-reload
   - netplan apply
-  - systemctl start ssh
-  - systemctl start avahi-daemon
-EOF
-)
-    else
-        user_data=$(cat <<EOF
+"
+
+    # Generate unified cloud-init user-data
+    user_data=$(cat <<EOF
 #cloud-config
 datasource_list: [ NoCloud, None ]
 final_message: "CLOUD-INIT-READY"
@@ -920,10 +1012,19 @@ fqdn: ${hostname}.local
 manage_etc_hosts: true
 package_update: false
 packages:
-  - openssh-server
-  - avahi-daemon
+$packages
 output:
   all: '| tee -a /var/log/cloud-init-output.log'
+write_files:
+$network_config  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      PermitRootLogin prohibit-password
+      UseDNS no
+      GSSAPIAuthentication no
 users:
   - name: $username
     gecos: $username
@@ -937,38 +1038,14 @@ chpasswd:
   list: |
     $username:$password
   expire: false
-write_files:
-  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
-    owner: root:root
-    permissions: '0644'
-    content: |
-      PasswordAuthentication yes
-      PubkeyAuthentication yes
-      PermitRootLogin prohibit-password
-      UseDNS no
-      GSSAPIAuthentication no
 runcmd:
-  - |
-    # Set hostname persistently
-    hostnamectl set-hostname $hostname || echo "$hostname" > /etc/hostname
-    hostname $hostname
-  - echo "$username:$password" | chpasswd
-  - passwd -u $username
-  - systemctl enable ssh
-  - systemctl enable avahi-daemon
-  - |
-    # Preserve SSH host keys across VM restarts
-    if [ ! -f /etc/ssh/.keys_generated ]; then
-      # Generate SSH host keys on first boot only
-      ssh-keygen -A
-      # Mark that keys have been generated to prevent regeneration
-      touch /etc/ssh/.keys_generated
-    fi
-  - systemctl start ssh
-  - systemctl start avahi-daemon
+  - hostnamectl set-hostname $hostname || echo "$hostname" > /etc/hostname && hostname $hostname
+  - echo "$username:$password" | chpasswd && passwd -u $username
+  - systemctl enable ssh && systemctl enable avahi-daemon
+  - [ ! -f /etc/ssh/.keys_generated ] && ssh-keygen -A && touch /etc/ssh/.keys_generated
+$runcmd_extra  - systemctl start ssh && systemctl start avahi-daemon
 EOF
 )
-    fi
 
     local meta_data="{\"instance-id\": \"$hostname\", \"local-hostname\": \"$hostname\"}"
     local seed_iso="$vm_dir/seed.iso"
@@ -1426,8 +1503,8 @@ vm_create() {
             local vm_info_file="$VMS_DIR/$vm_name/info.json"
 
             if [[ -f "$vm_info_file" ]]; then
-                local vm_ip=$(grep -o '"host": "[^"]*"' "$vm_info_file" 2>/dev/null | cut -d'"' -f4)
-                local vm_user=$(grep -o '"username": "[^"]*"' "$vm_info_file" 2>/dev/null | cut -d'"' -f4)
+                local vm_ip=$(json_get_string "$vm_info_file" "host")
+                local vm_user=$(json_get_string "$vm_info_file" "username")
 
                 if [[ -n "$vm_ip" && "$vm_ip" != "127.0.0.1" && "$vm_ip" != "dhcp-assigned" ]]; then
                     printf "  %-20s → %s (ssh %s@%s)\n" "$vm_name" "$vm_ip" "$vm_user" "$vm_ip"
@@ -1482,7 +1559,7 @@ vm_create() {
         if [[ -d "$VMS_DIR" ]]; then
             for existing_vm_dir in "$VMS_DIR"/*; do
                 if [[ -f "$existing_vm_dir/info.json" ]]; then
-                    local existing_ip=$(grep -o '"static_ip": "[^"]*"' "$existing_vm_dir/info.json" 2>/dev/null | cut -d'"' -f4)
+                    local existing_ip=$(json_get_string "$existing_vm_dir/info.json" "static_ip")
                     if [[ "$existing_ip" == "$static_ip" ]]; then
                         static_ip=$(get_next_available_ip)
                         break
@@ -1503,15 +1580,11 @@ vm_create() {
         local info_file="$vm_dir/info.json"
         if [[ -f "$info_file" ]]; then
             log "VM '$name' already exists. Checking if it's running..."
-            local pid_file="$vm_dir/qemu.pid"
-            if [[ -f "$pid_file" ]]; then
-                local pid=$(cat "$pid_file" 2>/dev/null || true)
-                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                    local existing_port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
-                    local existing_user=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
-                    local existing_pass=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
-                    error "VM '$name' is already running on port $existing_port (user: $existing_user, pass: $existing_pass)"
-                fi
+            if is_vm_running "$name"; then
+                local existing_port=$(json_get_number "$info_file" "port")
+                local existing_user=$(json_get_string "$info_file" "username")
+                local existing_pass=$(json_get_string "$info_file" "password")
+                error "VM '$name' is already running on port $existing_port (user: $existing_user, pass: $existing_pass)"
             fi
             log "VM directory exists but VM is not running. Recreating..."
         fi
@@ -1775,17 +1848,12 @@ EOF
             CURRENT_VM_DIR=""
 
             # Extract IP address from console log for bridge mode VMs
+            echo -ne "\r\033[K"  # Clear the progress line
             if [[ "$net_type" == "bridge" ]]; then
-                echo -ne "\r\033[K"  # Clear the progress line
-
-                local detected_ip=$(extract_vm_ip_from_log "$console_log" 90)
+                local detected_ip=$(detect_and_update_vm_ip "$name" 90)
                 if [[ -n "$detected_ip" ]]; then
-                    # Update info.json with the detected IP
-                    update_vm_ip_in_info "$info_json" "$detected_ip"
-                    echo -ne "\r\033[K"  # Clear the waiting message
                     show_success "$name" "$username" "$password" "IP Address: $detected_ip"
                 else
-                    echo -ne "\r\033[K"  # Clear the waiting message
                     show_success "$name" "$username" "$password" ""
                 fi
             else
@@ -1813,62 +1881,43 @@ vm_list() {
         log "No VMs found (VMs directory doesn't exist)"
         return
     fi
-    
+
     local vm_count=0
     echo
     printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "NAME" "STATUS" "ARCH" "IMAGE" "HOSTNAME" "CREDENTIALS"
     printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "----" "------" "----" "-----" "--------" "-----------"
-    
+
     for vm_dir in "$VMS_DIR"/*; do
         if [[ ! -d "$vm_dir" ]]; then
             continue
         fi
-        
+
         local vm_name=$(basename "$vm_dir")
         local info_file="$vm_dir/info.json"
-        local pid_file="$vm_dir/qemu.pid"
-        
+
         if [[ ! -f "$info_file" ]]; then
             printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "$vm_name" "BROKEN" "-" "-" "-" "-"
             ((vm_count++))
             continue
         fi
-        
+
         local status="STOPPED"
         local ssh_info="-"
         local credentials="-"
-        
+
         # Check if VM is running
-        local is_running=false
-        if [[ -f "$pid_file" ]]; then
-            local pid=$(cat "$pid_file" 2>/dev/null || true)
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                is_running=true
-            else
-                # Clean up stale PID file
-                rm -f "$pid_file"
-            fi
-        fi
-        
-        # Fallback check: look for running QEMU process with this VM name
-        if [[ "$is_running" == "false" ]]; then
-            if pgrep -f "qemu.*-name $vm_name" >/dev/null 2>&1; then
-                is_running=true
-            fi
-        fi
-        
-        if [[ "$is_running" == "true" ]]; then
+        if is_vm_running "$vm_name"; then
             status="RUNNING"
-            
-            # Extract info from JSON
-            local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
-            local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
-            local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
-            local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
-            
+
+            # Extract info from JSON using helper functions
+            local port=$(json_get_number "$info_file" "port")
+            local username=$(json_get_string "$info_file" "username")
+            local password=$(json_get_string "$info_file" "password")
+            local net_type=$(json_get_string "$info_file" "net_type")
+
             # Default to portfwd if net_type is not found
             [[ -z "$net_type" ]] && net_type="portfwd"
-            
+
             if [[ "$net_type" == "bridge" ]]; then
                 local sanitized_hostname=$(sanitize_hostname "$vm_name")
                 ssh_info="${sanitized_hostname}.local"
@@ -1877,15 +1926,15 @@ vm_list() {
             fi
             credentials="$username / $password"
         fi
-        
+
         # Get info from JSON file
-        local arch=$(grep -o '"arch": "[^"]*"' "$info_file" | cut -d'"' -f4)
-        local image=$(grep -o '"image": "[^"]*"' "$info_file" | cut -d'"' -f4)
-        
+        local arch=$(json_get_string "$info_file" "arch")
+        local image=$(json_get_string "$info_file" "image")
+
         printf "%-20s %-10s %-8s %-10s %-25s %-s\n" "$vm_name" "$status" "${arch:-arm64}" "${image:-unknown}" "$ssh_info" "$credentials"
         ((vm_count++))
     done
-    
+
     if [[ $vm_count -eq 0 ]]; then
         echo "No VMs found"
     else
@@ -1945,11 +1994,11 @@ vm_start() {
 
     log "Starting VM: $name"
 
-    # Extract VM info
-    local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
-    local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
-    local ssh_port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
-    local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    # Extract VM info using helper functions
+    local username=$(json_get_string "$info_file" "username")
+    local password=$(json_get_string "$info_file" "password")
+    local ssh_port=$(json_get_number "$info_file" "port")
+    local net_type=$(json_get_string "$info_file" "net_type")
 
     # Default to portfwd if net_type is not found
     [[ -z "$net_type" ]] && net_type="portfwd"
@@ -2005,13 +2054,13 @@ vm_start() {
     # Get VM files
     local vm_disk="$vm_dir/disk.qcow2"
     local seed_iso="$vm_dir/seed.iso"
-    
+
     if [[ ! -f "$vm_disk" ]]; then
         error "VM disk not found: $vm_disk"
     fi
-    
-    # Get architecture from VM info
-    local arch=$(grep -o '"arch": "[^"]*"' "$info_file" | cut -d'"' -f4)
+
+    # Get architecture from VM info using helper function
+    local arch=$(json_get_string "$info_file" "arch")
     [[ -z "$arch" ]] && arch="arm64"
     
     # Detect firmware for ARM64
@@ -2074,45 +2123,8 @@ vm_start() {
             exec "${qemu_args[@]}"
         fi
     else
-        local console_log="$vm_dir/console.log"
-        # Setup QEMU monitor socket for graceful shutdown
-        local monitor_socket="$vm_dir/monitor.sock"
-
-        qemu_args+=(
-            "-daemonize"
-            "-display" "none"
-            "-serial" "file:$console_log"
-            "-monitor" "unix:$monitor_socket,server,nowait"
-            "-pidfile" "$pid_file"
-        )
-        
-        if [[ "$net_type" == "bridge" ]]; then
-            # For bridge mode, we need sudo. The command will run in the background.
-            bridge_success=0
-            # Start QEMU - monitor socket permissions will be fixed after creation
-            if sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}"; then
-                # Note: QEMU will create the PID file automatically (as root)
-                # We need to wait a moment and then set correct permissions to read it.
-                # Our commands use fallback with pgrep if PID file can't be read
-
-                # Fix monitor socket permissions so user can access it without sudo
-                sleep 1
-                if [[ -S "$monitor_socket" ]]; then
-                    sudo chmod 666 "$monitor_socket" 2>/dev/null || true
-                fi
-                bridge_success=0
-            else
-                bridge_success=1
-            fi
-        else
-            bridge_success=0
-            if "${qemu_args[@]}" 2>/dev/null; then
-                : # Success
-            else
-                bridge_success=1
-            fi
-        fi
-        if [[ $bridge_success -eq 0 ]]; then
+        # Launch QEMU daemon using helper function
+        if launch_qemu_daemon "$name" "$vm_dir" "$net_type" "${qemu_args[@]}"; then
             # Wait for cloud-init completion if first boot
             if [[ ! -f "$first_boot_marker" ]]; then
                 show_progress "Starting VM" "$name"
@@ -2121,10 +2133,8 @@ vm_start() {
 
                     # Extract IP address from console log for bridge mode VMs
                     if [[ "$net_type" == "bridge" ]]; then
-                        local detected_ip=$(extract_vm_ip_from_log "$console_log" 90)
+                        local detected_ip=$(detect_and_update_vm_ip "$name" 90)
                         if [[ -n "$detected_ip" ]]; then
-                            # Update info.json with the detected IP
-                            update_vm_ip_in_info "$info_file" "$detected_ip"
                             show_success "$name" "$username" "$password" "IP Address: $detected_ip"
                         else
                             show_success "$name" "$username" "$password" ""
@@ -2138,33 +2148,20 @@ vm_start() {
                 fi
             else
                 # VM already initialized - wait for network and detect IP
+                sleep 3
                 if [[ "$net_type" == "bridge" ]]; then
-                    # First, try to get the saved IP from info.json
-                    local saved_ip=$(grep -o '"host": "[^"]*"' "$info_file" | cut -d'"' -f4)
+                    local saved_ip=$(json_get_string "$info_file" "host")
+                    local detected_ip=$(detect_and_update_vm_ip "$name" 15)
 
-                    # Wait a moment for VM to boot
-                    sleep 3
-
-                    # Try to detect fresh IP from console log (with reduced timeout since VM is already configured)
-                    local detected_ip=$(extract_vm_ip_from_log "$console_log" 15)
-
-                    # Now print everything together after detection completes
                     if [[ -n "$detected_ip" ]]; then
-                        # Update info.json with the detected IP
-                        update_vm_ip_in_info "$info_file" "$detected_ip"
-                        echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
-                        echo "IP Address: $detected_ip"
+                        show_vm_ready "$name" "$username" "$password" "$net_type" "IP Address: $detected_ip"
                     elif [[ -n "$saved_ip" && "$saved_ip" != "127.0.0.1" ]]; then
-                        # Use saved IP from previous run
-                        echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
-                        echo "IP Address: $saved_ip (from previous session - may have changed)"
+                        show_vm_ready "$name" "$username" "$password" "$net_type" "IP Address: $saved_ip (from previous session - may have changed)"
                     else
-                        # No IP available, show hostname only
-                        echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@${name}.local using password: ${password}"
-                        echo "Use './vm ip ${name}' to get the current IP address"
+                        show_vm_ready "$name" "$username" "$password" "$net_type" "Use './vm ip ${name}' to get the current IP address"
                     fi
                 else
-                    echo -e "${GREEN}✔${NC} VM ${name} is running and accessible via SSH with ${username}@127.0.0.1 -p ${ssh_port} using password: ${password}"
+                    show_vm_ready "$name" "$username" "$password" "$net_type" "$ssh_port"
                 fi
             fi
         else
@@ -2187,45 +2184,16 @@ vm_stop() {
         error "VM '$name' does not exist"
     fi
 
-    local pid=""
-    local is_root_process=false
-
-    # Try to find PID from pidfile first
-    if [[ -f "$pid_file" ]]; then
-        pid=$(cat "$pid_file" 2>/dev/null || true)
-        if [[ -n "$pid" ]]; then
-            # Check if process is running
-            if ! ps -p "$pid" > /dev/null 2>&1; then
-                log "VM '$name' is not running (cleaning up stale PID file)"
-                rm -f "$pid_file"
-                pid=""
-            else
-                # Check if process is owned by root
-                if [[ $(ps -o user= -p "$pid") == "root" ]]; then
-                    is_root_process=true
-                fi
-            fi
-        fi
+    # Get VM PID using helper function
+    local pid
+    if ! pid=$(get_vm_pid "$name"); then
+        log "VM '$name' is not running"
+        rm -f "$pid_file"
+        return
     fi
 
-    # If pidfile didn't work, try pgrep to find ALL processes for this VM
-    if [[ -z "$pid" ]]; then
-        local all_pids=$(pgrep -f "qemu.*-name $name")
-        if [[ -z "$all_pids" ]]; then
-            log "VM '$name' is not running"
-            return
-        fi
-        # Use the first PID for initial shutdown attempt
-        pid=$(echo "$all_pids" | head -1)
-        # Check if this process is owned by root
-        if [[ $(ps -o user= -p "$pid") == "root" ]]; then
-            is_root_process=true
-        fi
-    else
-        # Even if we have a PID from pidfile, check for duplicates
-        local all_pids=$(pgrep -f "qemu.*-name $name")
-    fi
-
+    # Check for multiple processes
+    local all_pids=$(pgrep -f "qemu.*-name $name" 2>/dev/null || true)
     local pid_count=$(echo "$all_pids" | wc -w)
     if [[ $pid_count -gt 1 ]]; then
         log "WARNING: Found $pid_count QEMU processes for VM '$name'. Will stop all of them."
@@ -2234,24 +2202,12 @@ vm_stop() {
     log "Found VM process with PID: $pid. Sending shutdown signal..."
 
     # Try graceful ACPI shutdown via QEMU monitor if available
-    # This works without sudo even for root processes
     local monitor_socket="$vm_dir/monitor.sock"
     local shutdown_success=false
 
     if [[ -S "$monitor_socket" ]]; then
         log "Attempting graceful ACPI shutdown via QEMU monitor..."
-
-        # Check if socket is accessible, if not try to fix permissions
-        if ! [[ -r "$monitor_socket" && -w "$monitor_socket" ]]; then
-            # Socket exists but we can't access it - try to fix permissions
-            if sudo -n chmod 666 "$monitor_socket" 2>/dev/null; then
-                : # Successfully fixed permissions without password prompt
-            else
-                # Need password for sudo - inform user
-                echo "Note: Fixing monitor socket permissions (one-time for this VM)..."
-                sudo chmod 666 "$monitor_socket" 2>/dev/null || true
-            fi
-        fi
+        fix_monitor_socket_permissions "$monitor_socket" 2>/dev/null || true
 
         # Try using socat if available, otherwise use nc (netcat)
         if command -v socat >/dev/null 2>&1; then
@@ -2270,7 +2226,7 @@ vm_stop() {
     # Fallback to kill signal if monitor not available
     if [[ "$shutdown_success" == false ]]; then
         log "QEMU monitor not available, using kill signal..."
-        if [[ "$is_root_process" == true ]]; then
+        if is_root_process "$pid"; then
             # Try passwordless sudo first
             if sudo -n kill -TERM "$pid" >/dev/null 2>&1; then
                 shutdown_success=true
@@ -2309,7 +2265,7 @@ vm_stop() {
 
         if ps -p "$pid" > /dev/null 2>&1; then
             log "Graceful shutdown timed out, forcing stop..."
-            if [[ "$is_root_process" == true ]]; then
+            if is_root_process "$pid"; then
                 sudo kill -KILL "$pid" 2>/dev/null
             else
                 kill -KILL "$pid" 2>/dev/null
@@ -2324,7 +2280,7 @@ vm_stop() {
             for remaining_pid in $remaining_pids; do
                 if [[ "$remaining_pid" != "$pid" ]]; then
                     log "Killing orphaned process: $remaining_pid"
-                    if [[ $(ps -o user= -p "$remaining_pid" 2>/dev/null) == "root" ]]; then
+                    if is_root_process "$remaining_pid"; then
                         sudo kill -KILL "$remaining_pid" 2>/dev/null || true
                     else
                         kill -KILL "$remaining_pid" 2>/dev/null || true
@@ -2350,42 +2306,30 @@ vm_stop() {
 vm_ip() {
     local name="$1"
     [[ -z "$name" ]] && error "VM name is required"
-    
+
     local vm_dir="$VMS_DIR/$name"
     local info_file="$vm_dir/info.json"
-    
+
     [[ ! -d "$vm_dir" || ! -f "$info_file" ]] && error "VM '$name' does not exist"
-    
-    local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
+
+    local net_type=$(json_get_string "$info_file" "net_type")
     [[ -z "$net_type" ]] && net_type="portfwd"
-    
+
     if [[ "$net_type" != "bridge" ]]; then
-        local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+        local port=$(json_get_number "$info_file" "port")
         echo "VM '$name' uses port forwarding: ssh user@127.0.0.1 -p $port"
         return
     fi
-    
-    local pid_file="$vm_dir/qemu.pid"
-    local pid=""
-    if [[ -f "$pid_file" ]]; then
-        pid=$(cat "$pid_file" 2>/dev/null || true)
+
+    if ! is_vm_running "$name"; then
+        echo "VM '$name' is not running"
+        return
     fi
 
-    # Fallback: search for process by name if PID file doesn't exist or is invalid
-    if [[ -z "$pid" ]] || ! ps -p "$pid" > /dev/null 2>&1; then
-        pid=$(pgrep -f "qemu.*-name $name" | head -1)
-        if [[ -z "$pid" ]]; then
-            echo "VM '$name' is not running"
-            return
-        fi
-    fi
-    
-    local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
-    local password=$(grep -o '"password": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    local username=$(json_get_string "$info_file" "username")
+    local password=$(json_get_string "$info_file" "password")
     local sanitized_hostname=$(sanitize_hostname "$name")
-
-    # Try to read IP from info.json first (cached from boot)
-    local cached_ip=$(grep -o '"host": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    local cached_ip=$(json_get_string "$info_file" "host")
 
     if [[ -n "$cached_ip" && "$cached_ip" != "dhcp-assigned" ]]; then
         echo "VM '$name' IP Address: $cached_ip"
@@ -2397,18 +2341,14 @@ vm_ip() {
 
     # Fallback: try to extract from console log
     echo "Searching for IP address in VM console log..."
-    local console_log="$vm_dir/console.log"
-    local detected_ip=$(extract_vm_ip_from_log "$console_log" 5)
+    local detected_ip=$(detect_and_update_vm_ip "$name" 5)
 
     if [[ -n "$detected_ip" ]]; then
-        # Update info.json for future use
-        update_vm_ip_in_info "$info_file" "$detected_ip"
         echo "Found IP: $detected_ip"
         echo "Connect with: ssh $username@$detected_ip"
         echo "Or use mDNS: ssh $username@${sanitized_hostname}.local"
         echo "Password: $password"
     else
-        # Last resort: use mDNS
         echo "Could not extract IP from console log"
         echo "Try mDNS: ssh $username@${sanitized_hostname}.local"
         echo "Password: $password"
@@ -2420,30 +2360,29 @@ vm_ip() {
 vm_ssh() {
     local name="$1"
     [[ -z "$name" ]] && error "VM name is required"
-    
+
     local vm_dir="$VMS_DIR/$name"
     local info_file="$vm_dir/info.json"
-    
+
     [[ ! -d "$vm_dir" || ! -f "$info_file" ]] && error "VM '$name' does not exist"
-    
-    local pid_file="$vm_dir/qemu.pid"
-    if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file" 2>/dev/null || true)" 2>/dev/null; then
+
+    if ! is_vm_running "$name"; then
         error "VM '$name' is not running"
     fi
-    
-    local username=$(grep -o '"username": "[^"]*"' "$info_file" | cut -d'"' -f4)
-    local net_type=$(grep -o '"net_type": "[^"]*"' "$info_file" | cut -d'"' -f4)
+
+    local username=$(json_get_string "$info_file" "username")
+    local net_type=$(json_get_string "$info_file" "net_type")
     [[ -z "$net_type" ]] && net_type="portfwd"
-    
+
     if [[ "$net_type" == "bridge" ]]; then
         local detected_ip
         if detected_ip=$(detect_bridge_vm_ip "$name" "$username"); then
             exec ssh "$username@$detected_ip"
         else
-            error "Could not detect VM IP address. Use './linux vm ip $name' first"
+            error "Could not detect VM IP address. Use './vm ip $name' first"
         fi
     else
-        local port=$(grep -o '"port": [0-9]*' "$info_file" | cut -d' ' -f2)
+        local port=$(json_get_number "$info_file" "port")
         exec ssh "$username@127.0.0.1" -p "$port"
     fi
 }
@@ -2468,14 +2407,13 @@ vm_delete() {
     done
     
     local vm_dir="$VMS_DIR/$name"
-    
+
     if [[ ! -d "$vm_dir" ]]; then
         error "VM '$name' does not exist"
     fi
-    
-    # Check for ANY running QEMU processes for this VM (not just pidfile)
-    local running_pids=$(pgrep -f "qemu.*-name $name" 2>/dev/null || true)
-    if [[ -n "$running_pids" ]]; then
+
+    # Check if VM is running and stop it
+    if is_vm_running "$name"; then
         log "Stopping running VM before deletion..."
         vm_stop "$name"
     fi
@@ -2593,15 +2531,15 @@ cleanup_orphaned_processes() {
     # Check how many are root processes
     local root_count=0
     for qemu_pid in "${orphaned_pids[@]}"; do
-        local process_owner=$(ps -o user= -p "$qemu_pid" 2>/dev/null)
-        if [[ "$process_owner" == "root" ]]; then
+        if is_root_process "$qemu_pid"; then
             ((root_count++))
         fi
     done
 
     for i in "${!orphaned_pids[@]}"; do
-        local process_owner=$(ps -o user= -p "${orphaned_pids[$i]}" 2>/dev/null)
-        echo "  - PID ${orphaned_pids[$i]}: VM '${orphaned_names[$i]}' (directory not found) [owner: $process_owner]"
+        local owner_label="user"
+        is_root_process "${orphaned_pids[$i]}" && owner_label="root"
+        echo "  - PID ${orphaned_pids[$i]}: VM '${orphaned_names[$i]}' (directory not found) [owner: $owner_label]"
     done
 
     if [[ $root_count -gt 0 ]]; then
@@ -2628,15 +2566,10 @@ cleanup_orphaned_processes() {
     local killed_count=0
     for qemu_pid in "${orphaned_pids[@]}"; do
         if ps -p "$qemu_pid" > /dev/null 2>&1; then
-            local process_owner=$(ps -o user= -p "$qemu_pid" 2>/dev/null)
-            if [[ "$process_owner" == "root" ]]; then
-                if sudo kill -KILL "$qemu_pid" 2>/dev/null; then
-                    ((killed_count++))
-                fi
+            if is_root_process "$qemu_pid"; then
+                sudo kill -KILL "$qemu_pid" 2>/dev/null && ((killed_count++))
             else
-                if kill -KILL "$qemu_pid" 2>/dev/null; then
-                    ((killed_count++))
-                fi
+                kill -KILL "$qemu_pid" 2>/dev/null && ((killed_count++))
             fi
         fi
     done
