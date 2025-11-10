@@ -527,10 +527,11 @@ EOF
                 return 1
             fi
 
-            # Allow both socket_vmnet_client and chmod for monitor sockets
+            # Allow socket_vmnet_client, chmod for monitor sockets, and kill for VM management
             cat <<EOF | sudo tee "$sudoers_file" > /dev/null
 $USER ALL=(ALL) NOPASSWD: $SOCKET_VMNET_CLIENT
 $USER ALL=(ALL) NOPASSWD: /bin/chmod 666 $HOME/.vm/vms/*/monitor.sock
+$USER ALL=(root) NOPASSWD: /bin/kill
 EOF
 
             if [[ -f "$sudoers_file" ]]; then
@@ -2251,16 +2252,16 @@ vm_stop() {
                 # Cannot use interactive sudo in non-interactive context
                 # Provide guidance on how to enable passwordless sudo
                 echo ""
-                echo "${YELLOW}WARNING:${NC} This VM is running as root and cannot be stopped without sudo access."
+                echo -e "${YELLOW}WARNING:${NC} This VM is running as root and cannot be stopped without sudo access."
                 echo ""
                 echo "To enable passwordless VM stop, add this to your sudoers file:"
-                echo "${GREEN}  $USER ALL=(root) NOPASSWD: /bin/kill${NC}"
+                echo -e "${GREEN}  $USER ALL=(root) NOPASSWD: /bin/kill${NC}"
                 echo ""
                 echo "Run this command to configure it:"
-                echo "${GREEN}  echo '$USER ALL=(root) NOPASSWD: /bin/kill' | sudo tee /etc/sudoers.d/vm_manager_kill${NC}"
+                echo -e "${GREEN}  echo '$USER ALL=(root) NOPASSWD: /bin/kill' | sudo tee /etc/sudoers.d/vm_manager_kill${NC}"
                 echo ""
                 echo "Or manually stop the VM with:"
-                echo "${GREEN}  sudo kill -TERM $pid${NC}"
+                echo -e "${GREEN}  sudo kill -TERM $pid${NC}"
                 echo ""
             fi
         else
