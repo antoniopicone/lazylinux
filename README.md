@@ -59,6 +59,10 @@ vm create --name myvm --memory 4G --cpus 4 --disk 20G
 # Create an x86_64 (amd64) VM (emulated on Apple Silicon)
 vm create --name myvm-amd64 --arch amd64
 
+# ARM64 VMs use HVF acceleration by default (faster)
+# You can force QEMU emulation if needed
+vm create --name myvm-no-accel --virt qemu
+
 # Create multiple VMs at once with comma-separated names
 vm create --name vm1,vm2,vm3 --user admin --pass test
 ```
@@ -136,6 +140,7 @@ vm delete VM_NAME
 | `--ssh-port PORT` | SSH port (auto-assigned when creating multiple VMs) | auto-assign |
 | `--ip IP_ADDRESS` | Static IP address for bridge mode (auto-generated when creating multiple VMs) | auto-generated |
 | `--net-type TYPE` | Network type (`bridge`, `portfwd`) | bridge |
+| `--virt TYPE` | Virtualization (`qemu`, `hvf`) - HVF = hardware acceleration (macOS ARM64 only) | hvf (arm64) / qemu (amd64) |
 | `--show-console` | Show console output | false |
 
 ### System Commands
