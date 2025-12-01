@@ -7,6 +7,7 @@ A simple command-line tool for creating and managing Linux virtual machines on m
 - **Easy VM Management**: Create, start, stop, and delete VMs with simple commands
 - **Image Management**: Download and manage cloud images (Debian 13 and 12, for now)
 - **Virtualization & Emulation**: Support both ARM and AMD architectures
+- **GUI Support**: Run VMs with graphical interface (OpenGL/3D or basic framebuffer)
 - **Automatic Setup**: Cloud-init configuration with SSH access
 - **Port Management**: Automatic SSH port assignment with conflict resolution
 - **Persistent Storage**: VM state preserved across restarts
@@ -61,6 +62,9 @@ vm create --name myvm-amd64 --arch amd64
 
 # Create multiple VMs at once with comma-separated names
 vm create --name vm1,vm2,vm3 --user admin --pass test
+
+# Create a VM with GUI (Graphical User Interface)
+vm create --name desktop --gui=gl --memory 4G
 ```
 
 **Note**: VM names with underscores will be automatically converted to hyphens for DNS compliance (e.g., `my_vm` → `my-vm`). You'll be prompted to confirm the conversion.
@@ -136,6 +140,7 @@ vm delete VM_NAME
 | `--ssh-port PORT` | SSH port (auto-assigned when creating multiple VMs) | auto-assign |
 | `--ip IP_ADDRESS` | Static IP address for bridge mode (auto-generated when creating multiple VMs) | auto-generated |
 | `--net-type TYPE` | Network type (`bridge`, `portfwd`) | bridge |
+| `--gui MODE` | GUI mode: `gl` (OpenGL/3D), `ramfb` (Basic), or `none` | none |
 | `--show-console` | Show console output | false |
 
 ### System Commands
@@ -212,6 +217,24 @@ vm create --name web1, web2, web3 --user www
 - SSH ports and IP addresses are automatically assigned to each VM to avoid conflicts
 - If one VM fails to create, the process continues with the remaining VMs
 - Static IP addresses are deterministically generated based on each VM's name
+- If one VM fails to create, the process continues with the remaining VMs
+
+### GUI Support
+
+You can run VMs with a graphical interface using the `--gui` flag:
+
+```bash
+# Basic GUI (framebuffer) - works on all systems
+vm create --name basic-gui --gui=ramfb
+
+# OpenGL/3D Acceleration (requires QEMU with GL support)
+vm create --name gl-gui --gui=gl --memory 4G
+```
+
+**Input Controls:**
+- **Mouse/Keyboard**: Automatically captured when clicking inside the window
+- **Release Input**: Press `Ctrl+Opt+G` or simply click outside the window (if supported)
+- **Tablet Mode**: Uses absolute positioning for better mouse integration
 
 ### Working with VMs
 

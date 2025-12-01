@@ -16,6 +16,18 @@ SOCKET_VMNET_SOCKET="$BREW_PREFIX/var/run/socket_vmnet"
 SOCKET_VMNET_BINARY="$BREW_PREFIX/opt/socket_vmnet/bin/socket_vmnet"
 SOCKET_VMNET_CLIENT="$BREW_PREFIX/opt/socket_vmnet/bin/socket_vmnet_client"
 
+# QEMU Binaries (support custom build)
+CUSTOM_QEMU_DIR="$WORK_ROOT/qemu/bin"
+if [[ -x "$CUSTOM_QEMU_DIR/qemu-system-aarch64" ]]; then
+    QEMU_AARCH64="$CUSTOM_QEMU_DIR/qemu-system-aarch64"
+    QEMU_X86_64="$CUSTOM_QEMU_DIR/qemu-system-x86_64"
+    QEMU_IMG="$CUSTOM_QEMU_DIR/qemu-img"
+else
+    QEMU_AARCH64="qemu-system-aarch64"
+    QEMU_X86_64="qemu-system-x86_64"
+    QEMU_IMG="qemu-img"
+fi
+
 # Global variables for interrupt handling
 CURRENT_VM_NAME=""
 CURRENT_VM_DIR=""
@@ -23,9 +35,9 @@ INTERRUPT_CLEANUP=false
 
 # Required binaries
 REQUIRED_BINS=(
-    "qemu-system-aarch64"
-    "qemu-system-x86_64"
-    "qemu-img"
+    "$QEMU_AARCH64"
+    "$QEMU_X86_64"
+    "$QEMU_IMG"
     "hdiutil"
 )
 
@@ -328,7 +340,7 @@ extract_vm_ip_from_log() {
             fi
 
             # Also check if cloud-init is ready (means network is configured)
-            if grep -q "CLOUD-INIT-READY" "$console_log" 2>/dev/null; then
+            if grep -q "installation completed" "$console_log" 2>/dev/null; then
                 # Cloud-init finished, try one more time
                 ip=$(grep "ci-info.*enp0s1.*True" "$console_log" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
                 if [[ -n "$ip" && "$ip" != "0.0.0.0" ]]; then
@@ -795,17 +807,35 @@ create_cloud_init() {
         user_data=$(cat <<EOF
 #cloud-config
 datasource_list: [ NoCloud, None ]
-final_message: "CLOUD-INIT-READY"
+final_message: |
+
+  ========================================
+  ants.os installation completed!
+
+  Please reboot the system to start ants.os:
+    sudo reboot
+  ========================================
+
 hostname: $hostname
 fqdn: ${hostname}.local
 manage_etc_hosts: true
 package_update: false
+package_upgrade: false
 packages:
   - openssh-server
   - avahi-daemon
-  - locales-all
+  - locales
+  - keyboard-configuration
+  - console-setup
+  - vim
+  - git
+  - curl
+  - wget
+  - htop
+  - sudo
 output:
   all: '| tee -a /var/log/cloud-init-output.log'
+locale: it_IT.UTF-8
 write_files:
   - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
     content: |
@@ -822,14 +852,61 @@ $netplan_config
     permissions: '0755'
     content: |
       #!/bin/bash
-      # Wait for network to be ready
       sleep 5
-      # Get IP address
       IP=\$(ip -4 addr show enp0s1 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}')
       if [ -n "\$IP" ]; then
           echo "VM_IP_ADDRESS: \$IP"
           logger "VM_IP_ADDRESS: \$IP"
       fi
+  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      PermitRootLogin prohibit-password
+      UseDNS no
+      GSSAPIAuthentication no
+  - path: /etc/default/keyboard
+    content: |
+      XKBMODEL="pc105"
+      XKBLAYOUT="it"
+      XKBVARIANT=""
+      XKBOPTIONS=""
+      BACKSPACE="guess"
+  - path: /etc/locale.gen
+    content: |
+      it_IT.UTF-8 UTF-8
+      en_US.UTF-8 UTF-8
+  - path: /etc/issue
+    content: |
+
+      System initialization in progress...
+
+      You can login now while the installation continues in background.
+
+      Monitor installation progress:
+        sudo tail -f /var/log/cloud-init-output.log
+
+      Hostname: $hostname
+
+  - path: /usr/local/bin/show-init-banner.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      clear
+      cat << 'BANNER'
+
+      ants.os - System Setup
+
+      Installation running in background...
+
+      You can login and use the system while setup completes.
+
+      To monitor progress:
+        sudo tail -f /var/log/cloud-init-output.log
+
+      BANNER
 users:
   - name: $username
     gecos: $username
@@ -840,34 +917,22 @@ users:
     plain_text_passwd: '$password'
 ssh_pwauth: true
 chpasswd:
-  list: |
-    $username:$password
   expire: false
-write_files:
-  - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
-    owner: root:root
-    permissions: '0644'
-    content: |
-      PasswordAuthentication yes
-      PubkeyAuthentication yes
-      PermitRootLogin prohibit-password
-      UseDNS no
-      GSSAPIAuthentication no
+  users:
+    - name: $username
+      password: $password
+      type: text
 runcmd:
-  - |
-    # Set hostname persistently
-    hostnamectl set-hostname $hostname || echo "$hostname" > /etc/hostname
-    hostname $hostname
-  - echo "$username:$password" | chpasswd
-  - passwd -u $username
+  - /usr/local/bin/show-init-banner.sh > /dev/tty1 2>&1 || true
+  - hostnamectl set-hostname $hostname || echo "$hostname" > /etc/hostname
+  - hostname $hostname
+  - locale-gen it_IT.UTF-8
+  - update-locale LANG=it_IT.UTF-8
   - systemctl enable ssh
   - systemctl enable avahi-daemon
   - |
-    # Preserve SSH host keys across VM restarts
     if [ ! -f /etc/ssh/.keys_generated ]; then
-      # Generate SSH host keys on first boot only
       ssh-keygen -A
-      # Mark that keys have been generated to prevent regeneration
       touch /etc/ssh/.keys_generated
     fi
   - mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d
@@ -875,35 +940,52 @@ runcmd:
   - netplan apply
   - systemctl start ssh
   - systemctl start avahi-daemon
+  - |
+    # Configure Italian keyboard for console and X11
+    DEBIAN_FRONTEND=noninteractive dpkg-reconfigure keyboard-configuration
+    setupcon -k --force
+    localectl set-keymap it
+    localectl set-x11-keymap it pc105
+    # Apply immediately to current session
+    loadkeys it || true
+    # Ensure persistence across reboots
+    echo 'KEYMAP=it' > /etc/vconsole.conf
+    echo 'XKBLAYOUT=it' >> /etc/vconsole.conf
 EOF
 )
     else
         user_data=$(cat <<EOF
 #cloud-config
 datasource_list: [ NoCloud, None ]
-final_message: "CLOUD-INIT-READY"
+final_message: |
+
+  ========================================
+  ants.os installation completed!
+
+  Please reboot the system to start ants.os:
+    sudo reboot
+  ========================================
+
 hostname: $hostname
 fqdn: ${hostname}.local
 manage_etc_hosts: true
 package_update: false
+package_upgrade: false
 packages:
   - openssh-server
   - avahi-daemon
+  - locales
+  - keyboard-configuration
+  - console-setup
+  - vim
+  - git
+  - curl
+  - wget
+  - htop
+  - sudo
 output:
   all: '| tee -a /var/log/cloud-init-output.log'
-users:
-  - name: $username
-    gecos: $username
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    groups: [sudo]
-    shell: /bin/bash
-    lock_passwd: false
-    plain_text_passwd: '$password'
-ssh_pwauth: true
-chpasswd:
-  list: |
-    $username:$password
-  expire: false
+locale: it_IT.UTF-8
 write_files:
   - path: /etc/ssh/sshd_config.d/50-cloud-init.conf
     owner: root:root
@@ -914,25 +996,87 @@ write_files:
       PermitRootLogin prohibit-password
       UseDNS no
       GSSAPIAuthentication no
+  - path: /etc/default/keyboard
+    content: |
+      XKBMODEL="pc105"
+      XKBLAYOUT="it"
+      XKBVARIANT=""
+      XKBOPTIONS=""
+      BACKSPACE="guess"
+  - path: /etc/locale.gen
+    content: |
+      it_IT.UTF-8 UTF-8
+      en_US.UTF-8 UTF-8
+  - path: /etc/issue
+    content: |
+
+      System initialization in progress...
+
+      You can login now while the installation continues in background.
+
+      Monitor installation progress:
+        sudo tail -f /var/log/cloud-init-output.log
+
+      Hostname: $hostname
+
+  - path: /usr/local/bin/show-init-banner.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      clear
+      cat << 'BANNER'
+
+      ants.os - System Setup
+
+      Installation running in background...
+
+      You can login and use the system while setup completes.
+
+      To monitor progress:
+        sudo tail -f /var/log/cloud-init-output.log
+
+      BANNER
+users:
+  - name: $username
+    gecos: $username
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: '$password'
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  users:
+    - name: $username
+      password: $password
+      type: text
 runcmd:
-  - |
-    # Set hostname persistently
-    hostnamectl set-hostname $hostname || echo "$hostname" > /etc/hostname
-    hostname $hostname
-  - echo "$username:$password" | chpasswd
-  - passwd -u $username
+  - /usr/local/bin/show-init-banner.sh > /dev/tty1 2>&1 || true
+  - hostnamectl set-hostname $hostname || echo "$hostname" > /etc/hostname
+  - hostname $hostname
+  - locale-gen it_IT.UTF-8
+  - update-locale LANG=it_IT.UTF-8
   - systemctl enable ssh
   - systemctl enable avahi-daemon
   - |
-    # Preserve SSH host keys across VM restarts
     if [ ! -f /etc/ssh/.keys_generated ]; then
-      # Generate SSH host keys on first boot only
       ssh-keygen -A
-      # Mark that keys have been generated to prevent regeneration
       touch /etc/ssh/.keys_generated
     fi
   - systemctl start ssh
   - systemctl start avahi-daemon
+  - |
+    # Configure Italian keyboard for console and X11
+    DEBIAN_FRONTEND=noninteractive dpkg-reconfigure keyboard-configuration
+    setupcon -k --force
+    localectl set-keymap it
+    localectl set-x11-keymap it pc105
+    # Apply immediately to current session
+    loadkeys it || true
+    # Ensure persistence across reboots
+    echo 'KEYMAP=it' > /etc/vconsole.conf
+    echo 'XKBLAYOUT=it' >> /etc/vconsole.conf
 EOF
 )
     fi
@@ -1041,6 +1185,7 @@ build_qemu_args() {
     local vm_disk="$6"
     local firmware="$7"
     local net_type="$8"
+    local gui_mode="${9:-none}"  # NEW: none, ramfb, gl
     
     # Generate unique MAC address for this VM
     local mac_addr=$(generate_mac_address "$name")
@@ -1066,6 +1211,15 @@ build_qemu_args() {
         fi
         qemu_args+=("-device" "virtio-rng-pci")
         qemu_args+=("-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2")
+        
+        # GPU and display for AMD64
+        if [[ "$gui_mode" == "gl" ]]; then
+            qemu_args+=("-device" "virtio-vga-gl")
+            qemu_args+=("-display" "cocoa,gl=on")
+        elif [[ "$gui_mode" == "ramfb" ]]; then
+            qemu_args+=("-device" "VGA")
+            qemu_args+=("-display" "cocoa")
+        fi
     else
         # ARM64 configuration
         qemu_args+=("qemu-system-aarch64")
@@ -1083,8 +1237,31 @@ build_qemu_args() {
         fi
         qemu_args+=("-device" "virtio-rng-pci")
         qemu_args+=("-drive" "file=$vm_disk,if=virtio,cache=writeback,format=qcow2")
+        
+        # GPU and display for ARM64
+        if [[ "$gui_mode" == "gl" ]]; then
+            qemu_args+=("-device" "virtio-gpu-pci")
+            qemu_args+=("-display" "cocoa")
+        elif [[ "$gui_mode" == "ramfb" ]]; then
+            qemu_args+=("-device" "ramfb")
+            qemu_args+=("-display" "cocoa")
+        fi
     fi
     
+    # Add input devices for GUI mode
+    if [[ "$gui_mode" != "none" ]]; then
+        # Add USB controller and devices for better input handling
+        qemu_args+=("-device" "qemu-xhci,id=usb")
+        qemu_args+=("-device" "usb-tablet")
+        qemu_args+=("-device" "usb-kbd")
+        # Add virtio input devices for better performance/compatibility
+        qemu_args+=("-device" "virtio-keyboard-pci")
+        qemu_args+=("-device" "virtio-mouse-pci")
+    fi
+
+    # Add serial device for console output (used to monitor VM status)
+    # This is added by vm_create and vm_start when setting up console.log
+
     # Return all arguments
     printf '%s\n' "${qemu_args[@]}"
 }
@@ -1223,6 +1400,9 @@ Create options:
     --net-type TYPE     Network type (default: bridge, options: bridge, portfwd)
     --ip IP_ADDRESS     Static IP address for bridge mode (optional - auto-generated if not provided)
                         Auto-generated IPs are deterministic based on VM name (range: 192.168.105.100-254)
+    --gui [MODE]        Enable GUI (default: ramfb, options: ramfb, gl)
+                        ramfb: Basic framebuffer
+                        gl: OpenGL/3D acceleration (virtio-gpu-gl)
     --show-console      Show console output
     --debug             Show debug information including QEMU command
 
@@ -1233,6 +1413,8 @@ Examples:
     $0 create --name myvm --ip 192.168.105.150  # Create VM with specific static IP
     $0 create --name vm1,vm2,vm3 --user admin --pass test  # Create 3 VMs with same config
     $0 create --arch amd64 --memory 4G
+    $0 create --gui                     # Create VM with basic GUI (ramfb)
+    $0 create --gui=gl --name desktop   # Create VM with OpenGL acceleration
     $0 list
     $0 start myvm
     $0 ssh myvm
@@ -1258,6 +1440,7 @@ vm_create() {
     local static_ip=""
     local show_console=false
     local debug=false
+    local gui_mode="none"
 
     # Set up interrupt handling
     trap cleanup_vm_on_interrupt SIGINT
@@ -1313,6 +1496,20 @@ vm_create() {
                 ;;
             --show-console)
                 show_console=true
+                shift
+                ;;
+            --gui)
+                if [[ -n "$2" && "$2" != --* ]]; then
+                    gui_mode="$2"
+                    shift 2
+                else
+                    gui_mode="ramfb"
+                    shift
+                fi
+                ;;
+            --gui=*)
+                gui_mode="${1#*=}"
+                [[ -z "$gui_mode" ]] && gui_mode="ramfb"
                 shift
                 ;;
             --debug)
@@ -1481,6 +1678,8 @@ vm_create() {
                 fi
             fi
             log "VM directory exists but VM is not running. Recreating..."
+            # Remove existing directory to ensure clean slate (prevents arch mismatch if reusing disk)
+            rm -rf "$vm_dir"
         fi
     fi
     
@@ -1557,6 +1756,7 @@ vm_create() {
   "password": "$password",
   "net_type": "$net_type",
   "static_ip": "$static_ip",
+  "gui_mode": "$gui_mode",
   "ssh": {
     "host": "$static_ip",
     "port": 22
@@ -1572,6 +1772,7 @@ EOF
   "username": "$username",
   "password": "$password",
   "net_type": "$net_type",
+  "gui_mode": "$gui_mode",
   "ssh": {
     "host": "127.0.0.1",
     "port": $ssh_port
@@ -1584,7 +1785,7 @@ EOF
     local qemu_args=()
     while IFS= read -r line; do
         qemu_args+=("$line")
-    done < <(build_qemu_args "$name" "$arch" "$memory" "$cpus" "$ssh_port" "$vm_disk" "$firmware" "$net_type")
+    done < <(build_qemu_args "$name" "$arch" "$memory" "$cpus" "$ssh_port" "$vm_disk" "$firmware" "$net_type" "$gui_mode")
     
     # Add cloud-init for first boot only
     local first_boot_marker="$vm_dir/.first_boot_complete"
@@ -1650,9 +1851,60 @@ EOF
         # Setup QEMU monitor socket for graceful shutdown
         local monitor_socket="$vm_dir/monitor.sock"
 
+        # GUI mode: run in foreground, no daemonize
+        if [[ "$gui_mode" != "none" ]]; then
+            qemu_args+=(
+                "-serial" "file:$console_log"
+                "-serial" "vc"
+                "-monitor" "unix:$monitor_socket,server,nowait"
+            )
+            
+            # Only add pidfile for non-bridge mode
+            if [[ "$net_type" != "bridge" ]]; then
+                qemu_args+=("-pidfile" "$pid_file")
+            fi
+            
+            echo "Starting VM with GUI (mode: $gui_mode)..."
+            echo "Input Controls:"
+            echo "  - Ctrl+Opt+G: Toggle mouse/keyboard grab"
+            echo "  - Mouse/keyboard auto-release when window loses focus"
+            echo ""
+            
+            if [[ "$net_type" == "bridge" ]]; then
+                sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}" &
+                local qemu_pid=$!
+                echo "$qemu_pid" > "$pid_file" 2>/dev/null || true
+            else
+                "${qemu_args[@]}" &
+                local qemu_pid=$!
+                echo "$qemu_pid" > "$pid_file"
+            fi
+            
+            echo "VM started with PID: $qemu_pid"
+            
+            # Wait a moment and check if process is still running
+            sleep 2
+            if ! kill -0 $qemu_pid 2>/dev/null; then
+                echo -e "${RED}[ERROR]${NC} VM process died immediately after start."
+                echo "Check for errors above or try running with --debug"
+                return 1
+            fi
+            
+            echo "GUI window should appear shortly..."
+            return 0
+        fi
+        
+        # Headless mode: daemonize
         qemu_args+=(
             "-daemonize"
-            "-display" "none"
+        )
+        
+        # Only add -display none if GUI is not enabled
+        if [[ "$gui_mode" == "none" ]]; then
+            qemu_args+=("-display" "none")
+        fi
+        
+        qemu_args+=(
             "-serial" "file:$console_log"
             "-monitor" "unix:$monitor_socket,server,nowait"
         )
@@ -1763,6 +2015,15 @@ EOF
             # Clean up on timeout
             cleanup_vm_on_interrupt
             return 1
+        fi
+        
+        # Show GUI mode information if enabled
+        if [[ "$gui_mode" != "none" ]]; then
+            echo ""
+            echo "GUI Mode: $gui_mode"
+            echo "Input Controls:"
+            echo "  - Ctrl+Opt+G: Toggle mouse/keyboard grab"
+            echo "  - Mouse/keyboard auto-release when window loses focus"
         fi
     fi
     
@@ -1988,6 +2249,10 @@ vm_start() {
     local arch=$(grep -o '"arch": "[^"]*"' "$info_file" | cut -d'"' -f4)
     [[ -z "$arch" ]] && arch="arm64"
     
+    # Get GUI mode from VM info (default to none if not present)
+    local gui_mode=$(grep -o '"gui_mode": "[^"]*"' "$info_file" | cut -d'"' -f4)
+    [[ -z "$gui_mode" ]] && gui_mode="none"
+    
     # Detect firmware for ARM64
     local firmware=""
     if [[ "$arch" == "arm64" ]]; then
@@ -2000,7 +2265,7 @@ vm_start() {
     local cpus="$DEFAULT_CPUS"
     while IFS= read -r line; do
         qemu_args+=("$line")
-    done < <(build_qemu_args "$name" "$arch" "$memory" "$cpus" "$ssh_port" "$vm_disk" "$firmware" "$net_type")
+    done < <(build_qemu_args "$name" "$arch" "$memory" "$cpus" "$ssh_port" "$vm_disk" "$firmware" "$net_type" "$gui_mode")
     
     # Only add cloud-init for fresh VMs
     local first_boot_marker="$vm_dir/.first_boot_complete"
@@ -2052,9 +2317,67 @@ vm_start() {
         # Setup QEMU monitor socket for graceful shutdown
         local monitor_socket="$vm_dir/monitor.sock"
 
+        # GUI mode: run in foreground, no daemonize
+        if [[ "$gui_mode" != "none" ]]; then
+            qemu_args+=(
+                "-serial" "file:$console_log"
+                "-serial" "vc"
+                "-monitor" "unix:$monitor_socket,server,nowait"
+                "-pidfile" "$pid_file"
+            )
+            
+            echo "Starting VM with GUI (mode: $gui_mode)..."
+            echo "Input Controls:"
+            echo "  - Ctrl+Opt+G: Toggle mouse/keyboard grab"
+            echo "  - Mouse/keyboard auto-release when window loses focus"
+            echo ""
+            
+            if [[ "$net_type" == "bridge" ]]; then
+                sudo "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCKET" "${qemu_args[@]}" &
+                local qemu_pid=$!
+                # Wait a moment and check if process is still running
+                sleep 2
+                if ! kill -0 $qemu_pid 2>/dev/null; then
+                    echo -e "${RED}[ERROR]${NC} VM process died immediately after start."
+                    echo "Check for errors above or try running with --debug"
+                    return 1
+                fi
+                
+                # Fix monitor socket permissions
+                if [[ -S "$monitor_socket" ]]; then
+                    sudo chmod 666 "$monitor_socket" 2>/dev/null || true
+                fi
+                
+                echo "VM started with PID: $qemu_pid"
+                echo "GUI window should appear shortly..."
+                return 0
+            else
+                "${qemu_args[@]}" &
+                local qemu_pid=$!
+                # Wait a moment and check if process is still running
+                sleep 2
+                if ! kill -0 $qemu_pid 2>/dev/null; then
+                    echo -e "${RED}[ERROR]${NC} VM process died immediately after start."
+                    echo "Check for errors above or try running with --debug"
+                    return 1
+                fi
+                
+                echo "VM started with PID: $qemu_pid"
+                echo "GUI window should appear shortly..."
+                return 0
+            fi
+        fi
+
         qemu_args+=(
             "-daemonize"
-            "-display" "none"
+        )
+        
+        # Only add -display none if GUI is not enabled
+        if [[ "$gui_mode" == "none" ]]; then
+            qemu_args+=("-display" "none")
+        fi
+        
+        qemu_args+=(
             "-serial" "file:$console_log"
             "-monitor" "unix:$monitor_socket,server,nowait"
             "-pidfile" "$pid_file"
