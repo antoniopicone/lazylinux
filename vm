@@ -2502,28 +2502,124 @@ purge() {
     fi
     
     log "Deleting VMs..."
+
+    # First pass: stop all running VMs
+    local stopped_count=0
+    local root_pids=()
+    local needs_sudo=false
+
+    # Check if any VM processes are running as root
     for vm_dir in "$VMS_DIR"/*; do
         [[ ! -d "$vm_dir" ]] && continue
-        
+
+        local vm_name=$(basename "$vm_dir")
+        local all_pids=$(pgrep -f "qemu.*-name $vm_name" 2>/dev/null || true)
+
+        if [[ -n "$all_pids" ]]; then
+            for pid in $all_pids; do
+                if ps -p "$pid" > /dev/null 2>&1; then
+                    local process_owner=$(ps -o user= -p "$pid" 2>/dev/null)
+                    if [[ "$process_owner" == "root" ]]; then
+                        needs_sudo=true
+                        break 2
+                    fi
+                fi
+            done
+        fi
+    done
+
+    # Get sudo access upfront if needed
+    if [[ "$needs_sudo" == true ]]; then
+        log "Some VMs are running as root. Requesting sudo access..."
+        if ! sudo -v; then
+            error "Cannot obtain sudo access. Cannot stop root-owned QEMU processes."
+        fi
+    fi
+
+    # Now stop all VMs
+    for vm_dir in "$VMS_DIR"/*; do
+        [[ ! -d "$vm_dir" ]] && continue
+
         local vm_name=$(basename "$vm_dir")
         local pid_file="$vm_dir/qemu.pid"
-        
-        if [[ -f "$pid_file" ]]; then
+
+        # Check for running processes
+        local all_pids=$(pgrep -f "qemu.*-name $vm_name" 2>/dev/null || true)
+
+        if [[ -z "$all_pids" ]] && [[ -f "$pid_file" ]]; then
+            # Try pidfile if pgrep didn't find anything
             local pid=$(cat "$pid_file" 2>/dev/null || true)
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                kill -TERM "$pid" 2>/dev/null
-                sleep 2
-                kill -KILL "$pid" 2>/dev/null
+            if [[ -n "$pid" ]] && ps -p "$pid" > /dev/null 2>&1; then
+                all_pids="$pid"
             fi
         fi
-        
+
+        if [[ -n "$all_pids" ]]; then
+            log "Stopping VM: $vm_name"
+            for pid in $all_pids; do
+                if ps -p "$pid" > /dev/null 2>&1; then
+                    local process_owner=$(ps -o user= -p "$pid" 2>/dev/null)
+
+                    # Try graceful shutdown first
+                    if [[ "$process_owner" == "root" ]]; then
+                        sudo kill -TERM "$pid" 2>/dev/null || true
+                        root_pids+=("$pid")
+                    else
+                        kill -TERM "$pid" 2>/dev/null || true
+                    fi
+                    ((stopped_count++))
+                fi
+            done
+        fi
+    done
+
+    # Wait for graceful shutdowns
+    if [[ $stopped_count -gt 0 ]]; then
+        log "Waiting for VMs to stop..."
+        sleep 3
+    fi
+
+    # Second pass: force kill any remaining processes
+    for vm_dir in "$VMS_DIR"/*; do
+        [[ ! -d "$vm_dir" ]] && continue
+
+        local vm_name=$(basename "$vm_dir")
+        local all_pids=$(pgrep -f "qemu.*-name $vm_name" 2>/dev/null || true)
+
+        if [[ -n "$all_pids" ]]; then
+            log "Force killing VM: $vm_name"
+            for pid in $all_pids; do
+                if ps -p "$pid" > /dev/null 2>&1; then
+                    local process_owner=$(ps -o user= -p "$pid" 2>/dev/null)
+                    if [[ "$process_owner" == "root" ]]; then
+                        sudo kill -KILL "$pid" 2>/dev/null || true
+                    else
+                        kill -KILL "$pid" 2>/dev/null || true
+                    fi
+                fi
+            done
+            sleep 1
+        fi
+    done
+
+    # Third pass: delete VM directories
+    for vm_dir in "$VMS_DIR"/*; do
+        [[ ! -d "$vm_dir" ]] && continue
         rm -rf "$vm_dir"
     done
     
     [[ -d "$VMS_DIR" ]] && rmdir "$VMS_DIR" 2>/dev/null
     [[ -d "$WORK_ROOT" ]] && rmdir "$WORK_ROOT" 2>/dev/null
-    
+
     log "Deleted $vm_count VM(s)"
+
+    # Check for and clean up any orphaned QEMU processes
+    local remaining_qemu=$(pgrep -f "qemu-system" 2>/dev/null || true)
+    if [[ -n "$remaining_qemu" ]]; then
+        echo ""
+        log "Found orphaned QEMU processes remaining"
+        log "Run 'vm cleanup' to remove orphaned QEMU processes if needed"
+    fi
 }
 
 cleanup_orphaned_processes() {
