@@ -284,7 +284,7 @@ check_socket_vmnet() {
     # Check if socket_vmnet is installed
     if ! brew list socket_vmnet >/dev/null 2>&1; then
         echo -e "${YELLOW}[!]${NC} Bridge networking requires socket_vmnet."
-        echo "Install and start it with: $0 setup-bridge"
+        echo "Install and start it with: vm setup-bridge"
         echo "Or use port forwarding: --net-type portfwd"
         return 1
     fi
@@ -295,13 +295,13 @@ check_socket_vmnet() {
 
     if socket_vmnet_process_running; then
         echo -e "${YELLOW}[!]${NC} socket_vmnet appears to be running but socket ${SOCKET_VMNET_SOCKET} is unavailable."
-        echo "Try restarting it with: $0 setup-bridge"
+        echo "Try restarting it with: vm setup-bridge"
         echo "Or use port forwarding: --net-type portfwd"
         return 1
     fi
 
     echo -e "${YELLOW}[!]${NC} socket_vmnet service is not running."
-    echo "Start it with: $0 setup-bridge"
+    echo "Start it with: vm setup-bridge"
     echo "Or use port forwarding: --net-type portfwd"
     return 1
 }
@@ -1193,7 +1193,7 @@ diagnose_network() {
 
 usage() {
     cat <<EOF
-Usage: $0 COMMAND [options]
+Usage: vm COMMAND [options]
 
 Commands:
     install             Install vm command + setup bridge networking
@@ -1227,17 +1227,17 @@ Create options:
     --debug             Show debug information including QEMU command
 
 Examples:
-    $0 install                          # Install + setup bridge networking (one-time)
-    $0 create                           # Create VM with auto-generated name and IP
-    $0 create --name myvm               # Create VM with deterministic auto-generated IP
-    $0 create --name myvm --ip 192.168.105.150  # Create VM with specific static IP
-    $0 create --name vm1,vm2,vm3 --user admin --pass test  # Create 3 VMs with same config
-    $0 create --arch amd64 --memory 4G
-    $0 list
-    $0 start myvm
-    $0 ssh myvm
-    $0 diagnose                         # Check network configuration
-    $0 purge --force
+    vm install                          # Install + setup bridge networking (one-time)
+    vm create                           # Create VM with auto-generated name and IP
+    vm create --name myvm               # Create VM with deterministic auto-generated IP
+    vm create --name myvm --ip 192.168.105.150  # Create VM with specific static IP
+    vm create --name vm1,vm2,vm3 --user admin --pass test  # Create 3 VMs with same config
+    vm create --arch amd64 --memory 4G
+    vm list
+    vm start myvm
+    vm ssh myvm
+    vm diagnose                         # Check network configuration
+    vm purge --force
 EOF
 }
 
@@ -2475,7 +2475,7 @@ purge() {
         case $1 in
             --force) force=true; shift ;;
             --help|-h) 
-                echo "Usage: $0 purge [--force]"
+                echo "Usage: vm purge [--force]"
                 echo "  --force    Delete all VMs without confirmation"
                 echo "  --help     Show this help"
                 return 0
@@ -2658,18 +2658,35 @@ install_vscode_extension() {
         return 1
     }
 
+    # Check if node_modules exists, if not install dependencies
+    if [[ ! -d "node_modules" ]]; then
+        echo "Installing dependencies..."
+        if ! npm install >/dev/null 2>&1; then
+            echo -e "${RED}[ERROR]${NC} Failed to install dependencies"
+            echo "Try running manually: cd $vscode_dir && npm install"
+            return 1
+        fi
+        echo -e "${GREEN}✔${NC} Dependencies installed"
+    fi
+
     echo "Compiling TypeScript..."
-    npm run compile >/dev/null 2>&1 || {
+    if ! npm run compile >/dev/null 2>&1; then
         echo -e "${RED}[ERROR]${NC} Failed to compile extension"
+        echo "Try running manually: cd $vscode_dir && npm run compile"
+        # Show actual error for debugging
+        echo
+        echo "Error details:"
+        npm run compile 2>&1 | tail -20
         return 1
-    }
+    fi
     echo -e "${GREEN}✔${NC} Extension compiled"
 
     echo "Packaging extension..."
-    vsce package --allow-star-activation >/dev/null 2>&1 || {
+    if ! vsce package --allow-star-activation >/dev/null 2>&1; then
         echo -e "${RED}[ERROR]${NC} Failed to package extension"
+        echo "Try running manually: cd $vscode_dir && vsce package --allow-star-activation"
         return 1
-    }
+    fi
     echo -e "${GREEN}✔${NC} Extension packaged"
 
     local vsix_file=$(ls -t vm-manager-*.vsix 2>/dev/null | head -1)
@@ -2679,17 +2696,43 @@ install_vscode_extension() {
     fi
 
     local vsix_path="$vscode_dir/$vsix_file"
-    echo
-    echo -e "${GREEN}✔${NC} Extension built successfully: ${BLUE}$vsix_path${NC}"
-    echo
-    echo "To install the extension in VS Code:"
-    echo "  1. Open VS Code"
-    echo "  2. Press Cmd+Shift+P (or Ctrl+Shift+P on Linux)"
-    echo "  3. Type 'Extensions: Install from VSIX'"
-    echo "  4. Select the file: $vsix_path"
-    echo
-    echo "Or from command line (if 'code' command is available):"
-    echo -e "  ${BLUE}code --install-extension $vsix_path${NC}"
+    echo -e "${GREEN}✔${NC} Extension packaged: $vsix_file"
+
+    # Try to install the extension automatically
+    local code_cmd=""
+    local vscode_app="/Applications/Visual Studio Code.app"
+    local vscode_bin="$vscode_app/Contents/Resources/app/bin/code"
+
+    # Check if 'code' command is in PATH
+    if command -v code >/dev/null 2>&1; then
+        code_cmd="code"
+    # Check if VS Code is installed at default location on macOS
+    elif [[ -f "$vscode_bin" ]]; then
+        code_cmd="$vscode_bin"
+    fi
+
+    if [[ -n "$code_cmd" ]]; then
+        echo "Installing extension in VS Code..."
+        if "$code_cmd" --install-extension "$vsix_path" >/dev/null 2>&1; then
+            echo -e "${GREEN}✔${NC} Extension installed successfully!"
+            echo "Restart VS Code to activate the extension"
+        else
+            echo -e "${YELLOW}[!]${NC} Automatic installation failed"
+            if [[ "$code_cmd" == "$vscode_bin" ]]; then
+                echo "Install manually: \"$vscode_bin\" --install-extension $vsix_path"
+            else
+                echo "Install manually: code --install-extension $vsix_path"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}[!]${NC} VS Code not found"
+        echo
+        echo "Install the extension manually:"
+        echo "  1. Open VS Code"
+        echo "  2. Press Cmd+Shift+P (or Ctrl+Shift+P)"
+        echo "  3. Type 'Extensions: Install from VSIX'"
+        echo "  4. Select: $vsix_path"
+    fi
 }
 
 install_command() {
@@ -2722,34 +2765,44 @@ install_command() {
         return
     fi
 
-    if cp "$script_path" "$target_path" && chmod +x "$target_path"; then
+    # Try without sudo first
+    if cp "$script_path" "$target_path" 2>/dev/null && chmod +x "$target_path" 2>/dev/null; then
         echo -e "${GREEN}✔${NC} Command installed to: $target_path"
-        echo
-
-        # Run bridge networking setup
-        echo -e "${BLUE}[2/3]${NC} Setting up bridge networking"
-        echo
-        setup_bridge_networking
-
-        # Optional VS Code extension installation
-        echo
-        echo -e "${BLUE}[3/3]${NC} VS Code Extension (Optional)"
-        echo
-        read -p "Build the VS Code extension for VM management? (y/N): " vscode_confirm
-        if [[ "$vscode_confirm" == "y" || "$vscode_confirm" == "Y" ]]; then
-            install_vscode_extension
-        else
-            echo "Skipping VS Code extension build"
-        fi
-
-        echo
-        echo -e "${GREEN}✔ Installation Complete!   ${NC}"
-        echo
-        echo "Create your first VM with:"
-        echo -e "  ${BLUE}vm create${NC}"
     else
-        error "Failed to install. You may need to run with sudo: sudo $0 install"
+        # If failed, try with sudo for the copy operation only
+        echo -e "${YELLOW}[!]${NC} Permission denied. Installing with sudo..."
+        echo -e "${YELLOW}[!]${NC} This command requires your password to proceed:"
+        echo
+        if sudo cp "$script_path" "$target_path" && sudo chmod +x "$target_path"; then
+            echo -e "${GREEN}✔${NC} Command installed to: $target_path"
+        else
+            error "Failed to install command to $target_path"
+        fi
     fi
+
+    echo
+
+    # Run bridge networking setup
+    echo -e "${BLUE}[2/3]${NC} Setting up bridge networking"
+    echo
+    setup_bridge_networking
+
+    # Optional VS Code extension installation
+    echo
+    echo -e "${BLUE}[3/3]${NC} VS Code Extension (Optional)"
+    echo
+    read -p "Build the VS Code extension for VM management? (y/N): " vscode_confirm
+    if [[ "$vscode_confirm" == "y" || "$vscode_confirm" == "Y" ]]; then
+        install_vscode_extension
+    else
+        echo "Skipping VS Code extension build"
+    fi
+
+    echo
+    echo -e "${GREEN}✔ Installation Complete!   ${NC}"
+    echo
+    echo "Create your first VM with:"
+    echo -e "  ${BLUE}vm create${NC}"
 }
 
 uninstall_command() {
@@ -2775,7 +2828,7 @@ vm_help() {
     cat <<EOF
 VM Manager - Create and manage Linux VMs on macOS
 
-USAGE: $0 COMMAND [options]
+USAGE: vm COMMAND [options]
 
 COMMANDS:
     install             Install vm command + setup bridge networking
@@ -2809,7 +2862,7 @@ CREATE OPTIONS:
 
 INSTALLATION:
     First-time setup (installs vm command + configures bridge networking):
-        $0 install
+        vm install
 
     This will:
         1. Install vm command to /usr/local/bin
@@ -2817,16 +2870,16 @@ INSTALLATION:
         3. Configure passwordless sudo for VM operations
 
 EXAMPLES:
-    $0 install                              # First-time installation + setup
-    $0 diagnose                             # Check network configuration
-    $0 create                               # Create VM with random name (bridge mode)
-    $0 create --name myvm
-    $0 create --net-type portfwd            # Create VM with port forwarding
-    $0 create --arch amd64 --memory 4G
-    $0 list
-    $0 start myvm
-    $0 ssh myvm
-    $0 ip myvm                              # Get VM IP address
+    vm install                              # First-time installation + setup
+    vm diagnose                             # Check network configuration
+    vm create                               # Create VM with random name (bridge mode)
+    vm create --name myvm
+    vm create --net-type portfwd            # Create VM with port forwarding
+    vm create --arch amd64 --memory 4G
+    vm list
+    vm start myvm
+    vm ssh myvm
+    vm ip myvm                              # Get VM IP address
 EOF
 }
 
@@ -2853,7 +2906,7 @@ main() {
         install) shift; install_command "$@" ;;
         uninstall) shift; uninstall_command "$@" ;;
         help|--help|-h|"") vm_help ;;
-        *) error "Unknown command: $command. Use '$0 help' for usage information." ;;
+        *) error "Unknown command: $command. Use 'vm help' for usage information." ;;
     esac
 }
 
